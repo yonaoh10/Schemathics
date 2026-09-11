@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local runtime state (all reproducible from `make` targets)
+data/
+artifacts/
+mlruns/
+mlflow.db
+runs/
+loadtest/results/
+*.log
+
+# TabPFN foundation weights (44 MB), fetched on demand.
+.tabpfn_models/
+
+# Secrets
+.env

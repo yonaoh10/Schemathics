@@ -1,0 +1,103 @@
+# Everything a reviewer needs, in the order they would run it.
+#
+#   make setup      create the venv and install
+#   make data       generate bl_full_data.csv (skipped if a real extract is present)
+#   make ingest     CSV -> Delta table, with the data-quality gate
+#   make train      evaluation mode: time split, per-day metrics, nothing registered
+#   make train-prod production mode: fit on all data, register a version, move champion
+#   make serve      run the API locally
+#   make loadtest   open-loop latency sweep against a running API
+#   make test       the fast suite
+#   make test-all   everything, including the equivalence and gender-table checks
+#
+#   make all        data -> ingest -> production (registers) -> evaluation
+#   make up         the whole stack in Docker (MLflow, scheduler, API)
+
+SHELL := /bin/bash
+PYTHON ?= .venv/bin/python
+PIP ?= .venv/bin/pip
+export PYTHONPATH := $(CURDIR)/src
+COMPOSE := docker compose -f docker/docker-compose.yml
+
+# The offline-safe backend. Override for the real thing:
+#   make train-prod BACKEND=tabpfn_local
+#   make train-prod BACKEND=tabpfn_client   (needs TABPFN_TOKEN)
+BACKEND ?= catboost_fallback
+PORT ?= 8080
+
+.PHONY: help setup data ingest train train-prod serve loadtest test test-all \
+        lint clean all up down mlflow schedule rollback versions data-history
+
+# Only the header block above, not every later comment that happens to show a command.
+help:
+	@awk '/^#/ {sub(/^#[ ]?/, ""); print; next} {exit}' Makefile
+
+setup:
+	uv venv .venv --python 3.12 || python3.12 -m venv .venv
+	$(PIP) install -e ".[train,serve,dev]"
+	@echo "TabPFN is optional and large (torch). Install it with:"
+	@echo "  $(PIP) install -e '.[tabpfn]'"
+
+data:
+	$(PYTHON) -m bl_ranking.data.generate
+
+ingest: data
+	$(PYTHON) -m bl_ranking.data.ingest
+
+train: ingest
+	BL_MODEL__PAYOUT__BACKEND=$(BACKEND) $(PYTHON) -m bl_ranking.training.job --mode train_test
+
+train-prod: ingest
+	BL_MODEL__PAYOUT__BACKEND=$(BACKEND) $(PYTHON) -m bl_ranking.training.job --mode production
+
+# Production first so a model is registered before the slower evaluation runs - the
+# same ordering the Databricks job uses.
+all: train-prod train
+
+serve:
+	BL_SERVING__PORT=$(PORT) BL_MODEL__PAYOUT__BACKEND=$(BACKEND) ./scripts/serve.sh
+
+# Sweep rather than a single rate: the point at which achieved rps falls behind the
+# target is the capacity number, and a single point cannot show it.
+loadtest:
+	$(PYTHON) loadtest/run_load.py --url http://127.0.0.1:$(PORT)/rank \
+	  --rps 25,50,100,200,300,400 --duration 20 --warmup 5 \
+	  --out loadtest/results/latency.json
+
+schedule:
+	$(PYTHON) -m bl_ranking.ops.schedule --show
+
+# Rollback is a registry operation, not a redeploy: move the alias, restart the API.
+#   make rollback VERSION=3
+rollback:
+	@test -n "$(VERSION)" || (echo "usage: make rollback VERSION=<n>" && exit 1)
+	$(PYTHON) -m bl_ranking.ops.registry rollback --version $(VERSION)
+
+versions:
+	$(PYTHON) -m bl_ranking.ops.registry list
+
+data-history:
+	$(PYTHON) -m bl_ranking.data.delta_cli history
+
+test:
+	$(PYTHON) -m pytest tests -m "not slow" -q
+
+test-all:
+	$(PYTHON) -m pytest tests -q
+
+lint:
+	$(PYTHON) -m ruff check src tests loadtest
+
+mlflow:
+	$(COMPOSE) up mlflow -d
+	@echo "MLflow UI: http://localhost:5000"
+
+up:
+	$(COMPOSE) up -d --build mlflow api scheduler
+
+down:
+	$(COMPOSE) down
+
+clean:
+	rm -rf runs mlruns data/delta loadtest/results .pytest_cache
+	find . -name __pycache__ -type d -prune -exec rm -rf {} +

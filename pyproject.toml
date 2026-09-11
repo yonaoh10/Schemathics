@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bl-ranking"
+version = "1.0.0"
+description = "Production pipeline for the Business Loans brand-ranking models"
+readme = "README.md"
+# The research scripts use PEP 701 f-strings (nested quotes and newlines inside the
+# expression part, bl_models_train.py lines 263-265). Those only parse on 3.12+.
+requires-python = ">=3.12"
+
+dependencies = [
+  "pandas==2.2.3",
+  "numpy==1.26.4",
+  "scikit-learn==1.5.2",
+  "catboost==1.2.7",
+  "joblib==1.4.2",
+  "pyarrow==18.1.0",
+  "pyyaml==6.0.2",
+]
+
+# Console entry points. These are what the Databricks job tasks invoke
+# (python_wheel_task -> entry_point), so the same commands run locally and remotely.
+[project.scripts]
+bl-generate = "bl_ranking.data.generate:main"
+bl-ingest = "bl_ranking.data.ingest:main"
+bl-train = "bl_ranking.training.job:main"
+bl-schedule = "bl_ranking.ops.schedule:main"
+
+[project.optional-dependencies]
+# Everything the weekly training job needs on top of the base set.
+train = [
+  "mlflow==2.19.0",
+  "deltalake==0.24.0",
+  # 2.4 GB resident and 18 s to construct. Training needs it to build the gender
+  # lookup table; serving does not, which is the point of building the table.
+  "names-dataset==3.1.0",
+  "tabpfn-client==0.5.3",
+  "apscheduler==3.11.0",
+]
+# The serving image. Note what is absent: names-dataset, mlflow's full stack when a
+# bundle path is given, and anything else that is only needed to produce a model.
+serve = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.34.0",
+  "pydantic==2.10.4",
+  "orjson==3.10.13",
+  "prometheus-client==0.21.1",
+  "httpx==0.28.1",
+  "mlflow-skinny==2.19.0",
+]
+# Local TabPFN. Large (torch); install only where the default backend is used.
+tabpfn = ["tabpfn==8.5.0"]
+dev = [
+  "pytest==8.3.4",
+  "ruff==0.8.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+  # MLflow 2.19 still uses Pydantic v1 style validators internally; not ours to fix.
+  "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+  "ignore:.*datetime.datetime.utcnow.*:DeprecationWarning",
+]
+markers = [
+  "slow: exercises a full training run or the research pipeline (minutes)",
+  "needs_names_dataset: requires names-dataset installed (2.4 GB resident)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The vendored research scripts are excluded on purpose: they must stay byte-identical
+# to the upstream files, so lint findings there are not ours to fix.
+extend-exclude = ["src/bl_ranking/research"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]

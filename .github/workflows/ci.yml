@@ -1,0 +1,44 @@
+# The fast suite on every push. It deliberately needs no credentials, no TabPFN and no
+# network: the payout backend defaults to catboost_fallback and the gender table is
+# stubbed, so a contributor gets the same result CI does.
+#
+# The slow suite (feature equivalence against the research pipeline, and the gender
+# table against the live dataset) needs names-dataset, which is 2.4 GB resident. It runs
+# nightly rather than per push.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 is a hard floor: the research scripts use PEP 701 f-strings and do
+          # not parse on 3.11.
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[train,serve,dev]"
+      - run: ruff check src tests loadtest
+      - run: pytest tests -m "not slow" -q
+
+  test-slow:
+    # Equivalence and lookup-table checks. Nightly, and on demand.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[train,serve,dev]"
+      - run: pytest tests -m slow -q

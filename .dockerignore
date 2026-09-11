@@ -1,0 +1,24 @@
+# The build context must not carry local state. Without this the venv alone is ~3 GB
+# and the image build spends minutes copying files it will never use.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.git/
+.github/
+
+# Reproducible from `make` targets; never baked into an image.
+data/
+runs/
+mlruns/
+mlflow.db
+loadtest/results/
+*.log
+
+# 44 MB of TabPFN weights. Mount them, or add a deliberate COPY when baking an
+# offline image - silently inheriting them from a developer's working tree is worse.
+.tabpfn_models/
+
+.env

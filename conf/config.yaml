@@ -1,0 +1,114 @@
+# ---------------------------------------------------------------------------
+# Single source of truth for every tunable in the system.
+#
+# Resolution order (last wins):
+#   1. this file
+#   2. environment variables, prefixed BL_ and upper-cased, '__' for nesting
+#      e.g. BL_SERVING__WORKERS=2 overrides serving.workers
+#   3. explicit keyword arguments passed to Settings.load()
+#
+# Anything that changes model behaviour lives here so that it can be logged to
+# MLflow verbatim and a run can be reproduced from its parameters alone.
+# ---------------------------------------------------------------------------
+
+paths:
+  # Raw CSV landing zone (the Drive extract is dropped here).
+  raw_dir: data/raw
+  raw_file: bl_full_data.csv
+  # Delta table that the training job actually reads. Written by the ingest step.
+  delta_table: data/delta/bl_sessions
+  # Per-run scratch directory: staged snapshot, model files, researcher log.
+  run_root: runs
+
+data:
+  # Rolling training window. null = use every row in the table.
+  # Bounded windows keep weekly runs comparable as history accumulates.
+  lookback_days: null
+  # Days held out as the test set in train/test mode. The research code hard-codes
+  # 7 and the per-day report loop assumes 7; changing it needs a code change too.
+  days_for_test: 7
+
+model:
+  # Materialise the gender feature into a 4 MB lookup table shipped in the bundle.
+  # Costs ~47s per training run; removes names-dataset (18s, 2.4GB) from serving.
+  build_gender_lookup: true
+
+  # CatBoost hyper-parameters, mirrored from the research script so they appear
+  # in MLflow. Changing them here does NOT change the model - the research code
+  # owns them - these are logged for comparability only.
+  catboost:
+    random_seed: 42
+    depth: 8
+    n_estimators: 800
+    task_type: CPU
+    eval_metric: F1
+  payout:
+    # Which model answers "how much would this brand pay for this lead?" at serve time.
+    #
+    #   surrogate         a CatBoost student distilled from TabPFN's own predictions.
+    #                     ~1 ms. DEFAULT: on CPU it is the only option that fits a
+    #                     synchronous funnel budget. Fidelity vs the teacher is
+    #                     measured every run and logged to MLflow.
+    #   tabpfn_client     the research code's hosted API, with fit() lifted out of the
+    #                     request path. Exact. One network round trip per request.
+    #                     Needs TABPFN_TOKEN.
+    #   tabpfn_local      TabPFN weights in-process. Exact, no network, but ~5 s per
+    #                     request on CPU - batch scoring only, unless on GPU.
+    #   catboost_fallback no TabPFN at all. The degraded path when the others are
+    #                     unreachable, and what CI runs.
+    #
+    # See README "Productizing TabPFN" for the measured comparison.
+    backend: surrogate
+    # Which TabPFN teaches the surrogate at training time. Not used at serve time.
+    teacher: tabpfn_local
+    # Rows of in-context training data handed to TabPFN. The research code uses the
+    # 1000 most recent payout>0 rows; keep in sync with CONTEXT_SIZE there.
+    context_size: 1000
+    # tabpfn_local only. fit_with_cache precomputes the context forward pass, which is
+    # then serialised into the bundle so serving starts warm.
+    fit_mode: fit_with_cache
+    n_estimators: 4
+    device: auto
+    # Pin the hosted checkpoint so a provider-side upgrade cannot change payouts
+    # silently between two weekly runs. null = the server's current default.
+    model_path: null
+    # Teacher-labelled rows the student is fitted on. TabPFN costs ~12-17 ms per row
+    # on CPU, so 15k rows adds roughly four minutes to the weekly job - paid once a
+    # week to save ~260 ms on every request for the following week.
+    surrogate_sample_rows: 20000
+
+mlflow:
+  tracking_uri: null            # null -> ./mlruns file store
+  experiment: bl_brand_ranking
+  registered_model: bl_brand_ranker
+  # Alias the serving layer resolves. Rollback = move this alias to an older version.
+  serving_alias: champion
+
+serving:
+  host: 0.0.0.0
+  port: 8080
+  workers: 3                    # keep >=1 core free for the OS and the load generator
+  # Threads each worker may use for CatBoost / torch. workers * threads should not
+  # exceed the core count or p99 collapses under contention.
+  threads_per_worker: 1
+  # Reject requests that would queue longer than this (fail fast, the user is waiting).
+  request_timeout_ms: 1500
+  # Load models from the registry at start-up; falls back to a local run directory.
+  model_uri: null               # null -> models:/<registered_model>@<serving_alias>
+  # fast     - vectorised feature path, ~50ms of pandas overhead removed (default)
+  # research - the research pipeline verbatim; the reference the fast path is tested against
+  feature_path: fast
+
+schedule:
+  # Weekly production retrain, Sunday 05:00. Databricks wants a Quartz expression;
+  # the local APScheduler runner is configured from the same three fields.
+  cron: "0 0 5 ? * SUN *"
+  timezone: UTC
+  pause_status: UNPAUSED
+
+generator:
+  # Synthetic data generator - only used when no real extract is present.
+  sessions: 60000
+  start_date: "2025-12-11"
+  end_date: "2026-02-11"
+  seed: 20260211

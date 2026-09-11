@@ -1,0 +1,87 @@
+# Local stand-in for the Databricks workspace.
+#
+#   mlflow      tracking server + model registry   (Databricks: the workspace itself)
+#   train       one-shot training run              (Databricks: a Job task)
+#   scheduler   weekly Sunday 05:00 retrain        (Databricks: the Job's schedule)
+#   api         the serving endpoint               (Databricks: a Model Serving endpoint)
+#
+#   docker compose -f docker/docker-compose.yml up mlflow -d
+#   docker compose -f docker/docker-compose.yml run --rm train --mode production
+#   docker compose -f docker/docker-compose.yml up api -d
+#
+# The repository is bind-mounted so data/, runs/ and mlruns/ survive container restarts
+# and can be inspected from the host.
+
+name: bl-ranking
+
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.19.0
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --serve-artifacts
+    ports: ["5000:5000"]
+    volumes:
+      - ../mlruns:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: training
+    depends_on:
+      mlflow: {condition: service_healthy}
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      TABPFN_TOKEN: ${TABPFN_TOKEN:-}
+      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-tabpfn_local}
+    volumes:
+      - ..:/app
+    # Overridden on the command line, e.g. `run --rm train --mode production`.
+    command: ["python", "-m", "bl_ranking.training.job", "--mode", "train_test"]
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: training
+    depends_on:
+      mlflow: {condition: service_healthy}
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      TABPFN_TOKEN: ${TABPFN_TOKEN:-}
+      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-tabpfn_local}
+    volumes:
+      - ..:/app
+    command: ["python", "-m", "bl_ranking.ops.schedule"]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: serving
+    depends_on:
+      mlflow: {condition: service_healthy}
+    ports: ["8080:8080"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      TABPFN_TOKEN: ${TABPFN_TOKEN:-}
+      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-tabpfn_local}
+      BL_SERVING__WORKERS: ${BL_SERVING_WORKERS:-3}
+      BL_SERVING__THREADS_PER_WORKER: "1"
+    volumes:
+      - ..:/app
+    # Each worker holds its own copy of the model and the gender table (~400 MB).
+    # Sized for 3 workers with headroom; raise alongside BL_SERVING__WORKERS.
+    mem_limit: 4g
+    restart: unless-stopped
