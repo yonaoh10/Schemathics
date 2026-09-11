@@ -15,6 +15,12 @@
 name: bl-ranking
 
 services:
+
+# Default backend note: neither image installs the `tabpfn` extra (torch is ~2.5 GB),
+# so `tabpfn_local` cannot be constructed in them. The default here is the one backend
+# that always works offline; override it once for every service with, e.g.
+#   BL_PAYOUT_BACKEND=tabpfn_client TABPFN_TOKEN=... docker compose up
+
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.19.0
     command: >
@@ -43,7 +49,7 @@ services:
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       TABPFN_TOKEN: ${TABPFN_TOKEN:-}
-      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-tabpfn_local}
+      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-catboost_fallback}
     volumes:
       - ..:/app
     # Overridden on the command line, e.g. `run --rm train --mode production`.
@@ -59,7 +65,7 @@ services:
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       TABPFN_TOKEN: ${TABPFN_TOKEN:-}
-      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-tabpfn_local}
+      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-catboost_fallback}
     volumes:
       - ..:/app
     command: ["python", "-m", "bl_ranking.ops.schedule"]
@@ -76,7 +82,7 @@ services:
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       TABPFN_TOKEN: ${TABPFN_TOKEN:-}
-      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-tabpfn_local}
+      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-catboost_fallback}
       BL_SERVING__WORKERS: ${BL_SERVING_WORKERS:-3}
       BL_SERVING__THREADS_PER_WORKER: "1"
     volumes:

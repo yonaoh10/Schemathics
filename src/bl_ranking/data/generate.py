@@ -396,7 +396,9 @@ def _apply_labels(rng: np.random.Generator, rows: pd.DataFrame) -> pd.DataFrame:
     rows["payout"] = np.where(accepted, payout, np.nan)
     rows["client_id"] = [
         f"c{[b.name for b in BRANDS].index(x) + 101:04d}" if ok else np.nan
-        for x, ok in zip(names, has_brand)
+        # strict=True: these are per-row parallel arrays; a length mismatch is a bug
+        # in the generator, not something to silently truncate.
+        for x, ok in zip(names, has_brand, strict=True)
     ]
     rows["client_name"] = rows["client_name"].astype(object)
     return rows.drop(columns=["_strength"])

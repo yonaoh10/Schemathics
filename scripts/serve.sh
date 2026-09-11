@@ -14,6 +14,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 PYTHON="${PYTHON:-$REPO_ROOT/.venv/bin/python}"
+# A container (or a machine where the package is installed globally) has no
+# .venv. Fall back rather than exec a path that does not exist.
+if [[ ! -x "$PYTHON" ]]; then PYTHON="$(command -v python3 || command -v python)"; fi
 HOST="${BL_SERVING__HOST:-0.0.0.0}"
 PORT="${BL_SERVING__PORT:-8080}"
 WORKERS="${BL_SERVING__WORKERS:-3}"

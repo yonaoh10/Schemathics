@@ -45,6 +45,18 @@ class BrandRankerModel(mlflow.pyfunc.PythonModel):
         self._ranker = BrandRanker.load(bundle_dir, Settings.load())
 
     def predict(self, context: Any, model_input: Any, params: dict | None = None) -> pd.DataFrame:
+        """One row in, one ranking out, plus which model produced it.
+
+        `payout_backend` and `payout_exact` ride along on every row for the same reason
+        the HTTP endpoint returns them: when the payout model is the distilled student
+        rather than TabPFN itself, the ranking is an approximation, and a caller must be
+        able to see that without consulting a config file. Serving through MLflow rather
+        than through our own app must not lose that.
+        """
+        described = self._ranker.describe()
+        backend = str(described["payout_backend"])
+        exact = bool(described["payout_exact"])
+
         frame = _as_frame(model_input)
         rankings: list[str] = []
         for record in frame.to_dict(orient="records"):
@@ -55,7 +67,11 @@ class BrandRankerModel(mlflow.pyfunc.PythonModel):
             except Exception as exc:  # noqa: BLE001 - one bad row must not fail a batch
                 ranking = {"__error__": str(exc)}
             rankings.append(json.dumps(ranking))
-        return pd.DataFrame({"ranking": rankings})
+        return pd.DataFrame({
+            "ranking": rankings,
+            "payout_backend": [backend] * len(rankings),
+            "payout_exact": [exact] * len(rankings),
+        })
 
 
 def _as_frame(model_input: Any) -> pd.DataFrame:
@@ -73,5 +89,9 @@ def request_example() -> pd.DataFrame:
 
 def build_signature() -> ModelSignature:
     example = request_example()
-    output = pd.DataFrame({"ranking": ['{"brand": {"rank": 1.0, "expected_payout": 42.31}}']})
+    output = pd.DataFrame({
+        "ranking": ['{"brand": {"rank": 1.0, "expected_payout": 42.31}}'],
+        "payout_backend": ["surrogate"],
+        "payout_exact": [False],
+    })
     return infer_signature(example, output)

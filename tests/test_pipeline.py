@@ -216,8 +216,43 @@ def test_bundle_is_complete_and_self_describing(bundle):
     assert int((clients["client_name"] != "other").sum()) == manifest.n_brands
 
 
+# The digests of the two scripts exactly as they were handed over. Pinning them is the
+# whole audit trail: without this the checksum is recorded faithfully every run and
+# still never fails anything, because nothing compares it to a known-good value.
+VENDORED_SHA256 = {
+    "bl_models_train.py":
+        "b1274c55fb6b8eff0aad333ca540aba53e991a6862edefd9eaa434e5b43a573c",
+    "bl_exp_payout_predictor.py":
+        "d9ac9696ede0404c0f5273903394f085e2cb1b538187593afd0f1cb0b332b911",
+}
+VENDORED_COMBINED_SHA = "e9384db687f76093"
+
+
+def test_vendored_research_scripts_are_byte_for_byte_as_delivered():
+    """The claim 'we did not change the given code', as a failing test rather than prose."""
+    import hashlib
+
+    import bl_ranking.research as pkg
+
+    directory = Path(pkg.__file__).parent
+    for name, expected in VENDORED_SHA256.items():
+        actual = hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        assert actual == expected, (
+            f"{name} has been modified. The brief forbids changing the given functions "
+            f"and logic; if the change is deliberate, update VENDORED_SHA256 in the "
+            f"same commit so the edit is visible in review."
+        )
+
+
+def test_logged_digest_matches_the_vendored_scripts():
+    """The value written to MLflow is the one the pinned files produce."""
+    import bl_ranking.training.job as job
+
+    assert job.research_code_sha() == VENDORED_COMBINED_SHA
+
+
 def test_research_code_checksum_detects_an_edit(tmp_path, monkeypatch):
-    """The audit trail for 'the given scripts were not changed'."""
+    """Proves the detector works, so a passing checksum test means something."""
     import bl_ranking.training.job as job
 
     original = job.research_code_sha()
@@ -225,8 +260,22 @@ def test_research_code_checksum_detects_an_edit(tmp_path, monkeypatch):
     fake.mkdir()
     (fake / "bl_models_train.py").write_text("# edited\n")
     (fake / "bl_exp_payout_predictor.py").write_text("# edited\n")
-    monkeypatch.setattr(job, "RESEARCH_DIR", fake)
+    monkeypatch.setattr(job, "_research_dir", lambda: fake)
     assert job.research_code_sha() != original
+
+
+def test_checksum_refuses_to_report_over_a_missing_file(tmp_path, monkeypatch):
+    """A digest computed over an incomplete set would attest to nothing."""
+    import pytest
+
+    import bl_ranking.training.job as job
+
+    half = tmp_path / "research"
+    half.mkdir()
+    (half / "bl_models_train.py").write_text("# only one of the two\n")
+    monkeypatch.setattr(job, "_research_dir", lambda: half)
+    with pytest.raises(FileNotFoundError):
+        job.research_code_sha()
 
 
 def test_champion_alias_points_at_the_trained_version(bundle, settings):

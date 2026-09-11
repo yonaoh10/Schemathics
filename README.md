@@ -23,7 +23,7 @@ repository is the machinery around it.
 
 ```bash
 make setup          # venv + install
-make all            # generate data -> Delta -> train/test eval -> production + register
+make all            # generate data -> Delta -> production + register -> train/test eval
 make serve          # API on :8080
 make loadtest       # open-loop latency sweep
 ```
@@ -332,10 +332,15 @@ the numbers above are meant to let someone else overturn — and
 - **`tabpfn_local`** — weights in-process, `fit_with_cache`, and the fitted estimator
   (including its KV cache) serialised into the bundle so replicas start warm with zero
   network. Exact and private. Use it on GPU, or for batch.
-- **`catboost_fallback`** — no TabPFN at all. If the weights or the API are unreachable,
-  serving degrades to this and keeps answering. A slightly worse ranking beats a 503
-  while a user waits. Training does *not* degrade: a silently downgraded model would be
-  registered and served for a week.
+- **`catboost_fallback`** — no TabPFN at all. If the weights or the API are unreachable
+  *when a worker loads its model*, that worker degrades to this and keeps answering. A
+  slightly worse ranking beats a 503 while a user waits. Training does *not* degrade: a
+  silently downgraded model would be registered and served for a week.
+
+  The fallback is scoped to model load, not to each request: a worker that started
+  healthy and then loses the hosted API mid-life will return 500s until it restarts.
+  Closing that gap properly means a circuit breaker, not a silent per-request swap, and
+  it is listed under "what I would do next" rather than pretended away.
 
 Switch with one variable: `BL_MODEL__PAYOUT__BACKEND=tabpfn_client`.
 
@@ -533,7 +538,7 @@ The ones that carry weight:
 | `test_null_sub_ids_...` | the train/serve skew above stays fixed |
 | `test_research_code_checksum_...` | the vendored scripts have not been edited |
 | `test_local_and_databricks_schedules...` | the two schedules cannot drift |
-| `test_serving_degrades_rather_than_failing` | a TabPFN outage is a degraded ranking, not a 503 |
+| `test_serving_degrades_rather_than_failing_when_a_backend_cannot_load` | a TabPFN outage at model load is a degraded ranking, not a 503 |
 
 ---
 

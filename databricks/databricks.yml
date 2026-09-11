@@ -10,7 +10,7 @@
 #   compose service   Databricks resource
 #   ---------------   -------------------
 #   mlflow            the workspace's tracking server and Unity Catalog registry
-#   train             the two tasks of bl_weekly_training
+#   train             the three tasks of bl_weekly_training
 #   scheduler         the job's `schedule` block below - no process of our own
 #   api               the bl_brand_ranker model serving endpoint
 #
@@ -19,6 +19,15 @@
 
 bundle:
   name: bl-brand-ranking
+
+# Without this block the tasks below reference ../dist/*.whl and nothing ever produces
+# it, so `databricks bundle deploy` fails on a missing artifact. Declaring it makes the
+# deploy build the wheel from pyproject.toml first.
+artifacts:
+  bl_ranking_wheel:
+    type: whl
+    path: ..
+    build: python -m build --wheel
 
 variables:
   catalog:
@@ -97,7 +106,7 @@ resources:
               project: bl-brand-ranking
             spark_env_vars:
               # The training job is single-node pandas and CatBoost; Spark is only the
-              # host. The run peaks around 7.5 GB on a two-month window: 2.4 GB of that
+              # host. The run peaks around 9.5 GB on a two-month window: 2.4 GB of that
               # is the names-dataset import the research code does at module scope.
               #
               # BL_CONFIG matters: the tasks run from a wheel in site-packages, which

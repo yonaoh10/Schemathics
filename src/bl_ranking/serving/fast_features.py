@@ -2,7 +2,8 @@
 
 Why this exists
 ---------------
-Profiling one request (1 user x 15 brands) through the research pipeline gives ~50 ms,
+Profiling one request (1 user x 15 brands) through the research pipeline gives 60.3 ms
+p50 against the production model (81k training rows),
 and almost none of it is arithmetic. It is pandas per-operation overhead: a cross join
 (3.0 ms), a DataFrame construction from a dict (0.85 ms), four `to_datetime` calls
 (0.6 ms each), `Series.apply(lambda: pd.Series(...))` for the gender feature (1.3 ms),
@@ -10,7 +11,7 @@ and roughly twenty `.loc[mask, col] = value` assignments across the four band ma
 (0.33 ms each). That cost is per *operation*, not per row, so it does not shrink with
 the data - it is simply the price of expressing a 15-row transform as ~100 pandas calls.
 
-On a synchronous funnel endpoint, 50 ms of frame bookkeeping is the entire budget.
+On a synchronous funnel endpoint, 60 ms of frame bookkeeping is the entire budget.
 
 What this module is
 -------------------

@@ -25,18 +25,31 @@ COMPOSE := docker compose -f docker/docker-compose.yml
 BACKEND ?= catboost_fallback
 PORT ?= 8080
 
-.PHONY: help setup data ingest train train-prod serve loadtest test test-all \
+.PHONY: help setup setup-tabpfn data ingest train train-prod serve loadtest test test-all \
         lint clean all up down mlflow schedule rollback versions data-history
 
 # Only the header block above, not every later comment that happens to show a command.
 help:
 	@awk '/^#/ {sub(/^#[ ]?/, ""); print; next} {exit}' Makefile
 
+# `uv venv` deliberately creates an environment with no pip in it, so the install has
+# to go through `uv pip`. Falling through to the stdlib venv keeps the target working
+# on a machine that has neither uv nor a system pip in the new environment.
 setup:
-	uv venv .venv --python 3.12 || python3.12 -m venv .venv
-	$(PIP) install -e ".[train,serve,dev]"
+	@if command -v uv >/dev/null 2>&1; then \
+	  uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -e ".[train,serve,dev]"; \
+	else \
+	  python3.12 -m venv .venv && $(PIP) install -e ".[train,serve,dev]"; \
+	fi
 	@echo "TabPFN is optional and large (torch). Install it with:"
-	@echo "  $(PIP) install -e '.[tabpfn]'"
+	@echo "  make setup-tabpfn"
+
+setup-tabpfn:
+	@if command -v uv >/dev/null 2>&1; then \
+	  uv pip install --python .venv/bin/python -e ".[tabpfn]"; \
+	else \
+	  $(PIP) install -e ".[tabpfn]"; \
+	fi
 
 data:
 	$(PYTHON) -m bl_ranking.data.generate

@@ -73,7 +73,7 @@ model:
     # silently between two weekly runs. null = the server's current default.
     model_path: null
     # Teacher-labelled rows the student is fitted on. TabPFN costs ~12-17 ms per row
-    # on CPU, so 15k rows adds roughly four minutes to the weekly job - paid once a
+    # on CPU, so 20k rows adds roughly five minutes to the weekly job - paid once a
     # week to save ~455 ms on every request for the following week.
     surrogate_sample_rows: 20000
 

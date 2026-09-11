@@ -63,9 +63,14 @@ RUN chmod +x scripts/*.sh
 # TABPFN_CLIENT_CI_MODE: the hosted client otherwise wraps every call in a thread and
 #   busy-polls every 200 ms while drawing a spinner, quantising latency onto that grid.
 # TABPFN_MODEL_CACHE_DIR: where baked-in weights live, so a container needs no network.
+#
+# PYTHON: scripts/serve.sh defaults to the repo's .venv, which is how a developer runs
+#   it. This image installs into the system interpreter and has no .venv, so name it
+#   here rather than let the entrypoint exec a path that does not exist.
 ENV OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
+    PYTHON=python \
     BL_SERVING__PORT=8080 \
     TABPFN_DISABLE_TELEMETRY=1 \
     TABPFN_CLIENT_CI_MODE=true \

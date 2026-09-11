@@ -46,7 +46,7 @@ marked, rather than quietly trimmed.
 | workers | 3 uvicorn processes, 1 BLAS thread each |
 | server | uvloop, httptools, access log off, ORJSON responses |
 | feature path | `fast` (the vectorised path; equivalence-tested against the research one) |
-| payout backend | `surrogate` (the configured default; no network at request time) |
+| payout backend | `catboost_fallback` (the Makefile default, so the numbers are our own code end to end; `surrogate` is within noise of it) |
 | brands per request | 15 |
 | payloads | 200 distinct users, so the run is not one perfectly cached code path |
 

@@ -192,21 +192,23 @@ class TabPFNLocalBackend(PayoutBackend):
 
     This is the right backend for batch scoring and for producing the surrogate's
     training labels. It is **not** viable on the synchronous funnel path on CPU:
-    measured on this 4-core box, one predict over the 1000-row context costs
+    measured on this 4-core box, one request (15 brand rows against a 1000-row
+    context) costs, holding `n_estimators=2` so only the fit mode varies
 
-        fit_mode="low_memory"        ~54 s
-        fit_mode="fit_preprocessors" ~67 s
-        fit_mode="fit_with_cache"     ~5 s warm   (after an ~89 s one-off cache build)
+        fit_mode="low_memory"        37.3 s     and materially different answers
+        fit_mode="fit_preprocessors"  8.69 s    the library default
+        fit_mode="fit_with_cache"     0.26 s    after a ~14.9 s one-off cache build
 
-    Five seconds is three orders of magnitude over a page-load budget. A GPU changes
-    that; a CPU deployment does not. Saying so plainly is more useful than shipping a
-    default that times out.
+    At the shipped `n_estimators=4` a whole request measures 457 ms p50 over 200 users,
+    against 2.41 ms for the served path. Half a second is still the entire budget of a
+    page load. A GPU changes that; a CPU deployment does not. Saying so plainly is more
+    useful than shipping a default that times out.
 
     What `fit_with_cache` does is worth understanding, because it is the reason the
     surrogate is viable at all: TabPFN is in-context learning, so "fitting" is encoding
     the 1000 context rows. Our context is frozen between weekly retrains, so that
     encoding is computed once and the key/value cache kept. `save_fitted_tabpfn_model`
-    serialises that cache, so the ~89 s build happens once in the weekly job and every
+    serialises that cache, so the ~14.9 s build happens once in the weekly job and every
     serving replica starts warm with zero network.
     """
 

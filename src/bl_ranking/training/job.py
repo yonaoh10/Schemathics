@@ -170,18 +170,43 @@ def _clip(value: Any, limit: int = 480) -> Any:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _research_dir() -> Path:
+    """Where the vendored scripts actually live, source tree or installed wheel.
+
+    RESEARCH_DIR is derived from the repository root, which only exists when running
+    from a checkout. The Databricks tasks run from a wheel in site-packages, so resolve
+    through the imported package instead and fall back to the repo layout.
+    """
+    try:
+        import bl_ranking.research as pkg
+        return Path(pkg.__file__).parent
+    except Exception:  # noqa: BLE001 - the repo layout is the fallback, not an error
+        return RESEARCH_DIR
+
+
 def research_code_sha() -> str:
     """Checksum of the vendored research scripts.
 
     The brief says not to change the given functions and logic. This makes that
     auditable: the digest is recorded on every run, so an edit to either file would
     show up as a different value on the next one.
+
+    A missing file raises rather than being skipped. The earlier version hashed only
+    what it found, so a deployment without the research directory produced a
+    respectable-looking digest that attested to nothing at all - the one failure mode
+    an audit trail must not have.
     """
+    directory = _research_dir()
     digest = hashlib.sha256()
     for name in sorted(("bl_models_train.py", "bl_exp_payout_predictor.py")):
-        path = RESEARCH_DIR / name
-        if path.exists():
-            digest.update(path.read_bytes())
+        path = directory / name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"vendored research script missing: {path}. The checksum is the audit "
+                f"trail for 'the given code was not changed'; refusing to report one "
+                f"computed over an incomplete set."
+            )
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
 

@@ -4,7 +4,7 @@ Both models score the same 25 columns for the same rows, so the row data is buil
 and each model takes the representation it wants. Measured on a 15-brand request:
 
     frame.to_numpy(object)          0.02 ms
-    catboost.Pool(matrix, cats)     0.27 ms   <- built once, used by both models
+    catboost.Pool(matrix, cats)     0.33 ms   <- built once, used by both models
     pandas DataFrame construction   1.40 ms   <- only built if a model needs one
 
 Before this, the two CatBoost calls each rebuilt their own input and the payout backend

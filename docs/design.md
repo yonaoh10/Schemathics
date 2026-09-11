@@ -279,7 +279,8 @@ live worker actually loaded.
 
 | failure | what happens |
 |---|---|
-| TabPFN unreachable at serve time | degrade to `catboost_fallback`, tag the response, keep answering |
+| TabPFN unreachable when a worker loads its model | degrade to `catboost_fallback`, tag the response, keep answering |
+| TabPFN lost *after* a worker started healthy | not covered: that worker 500s until restart. Wants a circuit breaker |
 | TabPFN unreachable at train time | fail the run loudly; the current champion keeps serving |
 | a retrain fails | the scheduler logs and survives; the alias does not move; next week retries |
 | a worker cannot load its model | `/readyz` stays 503 so the load balancer skips it; `/healthz` stays green |
@@ -321,10 +322,11 @@ be removed entirely. Materialising the gender function into a 4 MB table makes t
 serving image not need the library at all, and it is exact by construction because the
 name universe is finite.
 
-**Serve the MLflow pyfunc directly instead of FastAPI.** Simpler, and it is in the
-compose file as proof the artifact is portable. Rejected as the primary path: the funnel
-wants a plain JSON dictionary, not `{"dataframe_records": [...]}`, and readiness,
-metrics and a typed request schema are not optional on a revenue path.
+**Serve the MLflow pyfunc directly instead of FastAPI.** Simpler, and the pyfunc is
+registered with every model version, so `mlflow models serve -m models:/bl_brand_ranker@champion`
+works and the Databricks endpoint uses exactly that artifact. Rejected as the primary
+local path: the funnel wants a plain JSON dictionary, not `{"dataframe_records": [...]}`,
+and readiness, metrics and a typed request schema are not optional on a revenue path.
 
 **A closed-loop load test.** Every worker sends, waits, sends. Rejected: it hides tail
 latency exactly when a service is struggling, because a stalled server stalls the client
@@ -358,3 +360,11 @@ automatically instead of by reading.
 **Drift monitoring on the inputs.** Databricks inference tables are already enabled in
 the bundle. The signal to watch is the band-sentinel share and the categorical novelty
 rate — those move first when the funnel changes.
+
+**A circuit breaker around the hosted payout backend.** Today the fallback to
+`catboost_fallback` happens when a worker cannot construct its backend at load time.
+A worker that starts healthy and then loses the hosted API returns 500s until it is
+restarted. The right shape is a breaker that trips after N consecutive failures,
+serves the fallback while open, and retries on a timer — not a silent per-request
+model swap, which would make the ranking quietly non-deterministic under partial
+outage.

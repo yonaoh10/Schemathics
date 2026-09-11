@@ -12,7 +12,8 @@ themselves: the brand in position one, the top three as a set, and the full orde
     python scripts/compare_backends.py --users 200
 
 Needs the TabPFN weights (`pip install -e '.[tabpfn]'`). It is slow by construction,
-because the whole point is that the teacher is slow: roughly 0.26 s per user on CPU.
+because the whole point is that the teacher is slow: roughly 0.46 s per user on CPU
+at the shipped `n_estimators=4`.
 """
 
 from __future__ import annotations
