@@ -52,6 +52,11 @@ SURVEY_COLUMNS: list[str] = [
 #
 # This has to happen at read time. Once pandas has rounded a float there is nothing
 # downstream that can recover the original integer.
+# The attribution ids the research code fills and stringifies together, and the value
+# it fills them with (bl_models_train.py: `fillna('Other')` then `.astype(str)`).
+SUB_ID_COLUMNS = ("sub1", "sub2", "sub3")
+RESEARCH_NULL_CATEGORY = "Other"
+
 READ_AS_TEXT: dict[str, str] = {
     "campaign_id": "string",
     "sub1": "string",
@@ -145,7 +150,7 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     #    Normalising to a clean string here makes both sides agree.
     #    Reading them as text (READ_AS_TEXT) is what makes the repair possible at all.
     sub_repairs = 0
-    for col in ("sub1", "sub2", "sub3"):
+    for col in SUB_ID_COLUMNS:
         if col not in frame.columns:
             continue
         before = frame[col].astype(str)
@@ -217,10 +222,26 @@ def stage_for_research_code(frame: pd.DataFrame, run_dir: Path) -> tuple[Path, s
 
     Returns (directory, filename) so the caller can hand them straight to the
     BLPayoutModelsFit constructor.
+
+    One repair has to survive this round trip, and by default it does not. `sanitise`
+    normalises sub1/sub2/sub3 to clean strings and leaves their nulls as null, so the
+    research code's own `fillna('Other')` keeps meaning what it always meant. But a
+    null written to CSV is an empty cell, and `pd.read_csv` then infers float64 for a
+    column whose remaining values are all digits - the exact demotion the gate exists
+    to undo. `.astype(str)` turns 7448788 into '7448788.0' in training while a request
+    carries '7448788', so the feature misses on every single call.
+
+    Applying the research code's own fill here, before the write, keeps the column
+    textual: its `fillna('Other')` then finds nothing to do, and both sides produce the
+    same level. No value changes - nulls still become 'Other'.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     filename = "bl_full_data.csv"
-    frame.to_csv(run_dir / filename, index=False)
+    staged = frame.copy()
+    for col in SUB_ID_COLUMNS:
+        if col in staged.columns:
+            staged[col] = staged[col].fillna(RESEARCH_NULL_CATEGORY).astype(str)
+    staged.to_csv(run_dir / filename, index=False)
     return run_dir, filename
 
 

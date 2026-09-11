@@ -384,3 +384,45 @@ def test_manifest_round_trips(tmp_path):
     manifest.write(tmp_path)
     assert json.loads((tmp_path / bundle_files.MANIFEST_FILE).read_text())["delta_version"] == 3
     assert bundle_files.Manifest.read(tmp_path).payout_backend == "tabpfn_local"
+
+def test_attribution_ids_survive_the_csv_staging_round_trip(tmp_path):
+    """The train/serve skew this repo claims to have closed, as an executable check.
+
+    `sanitise` normalises sub1/sub2/sub3 and leaves their nulls null, because the
+    research code fills them itself. Staging writes the frame back to CSV and the
+    research code re-reads it with a bare `pd.read_csv`, which infers float64 for a
+    digits-plus-empties column - and `.astype(str)` then yields '7448788.0' in
+    training against '7448788' from a request. Two of the fourteen categorical
+    features would miss on every single call, with nothing in any log.
+
+    This asserts the level a training run produces equals the level the serving
+    feature path produces, for the same raw id.
+    """
+    import pandas as pd
+
+    from bl_ranking.data import ingest
+    from bl_ranking.serving import fast_features
+    from bl_ranking.serving.ranker import WARMUP_USER
+
+    raw_id = "7448788"
+    frame = pd.DataFrame({
+        # A null in the column is what triggers the demotion, so it must be present.
+        "sub1": pd.array([raw_id, None], dtype="object"),
+        "sub2": pd.array(["07448788 Ad set", None], dtype="object"),
+        "sub3": pd.array(["1021632077", None], dtype="object"),
+    })
+    ingest.stage_for_research_code(frame, tmp_path / "input")
+    staged = pd.read_csv(tmp_path / "input" / "bl_full_data.csv")
+
+    # The research code's own two lines, verbatim in effect.
+    training_levels = staged["sub1"].fillna("Other").astype(str).tolist()
+
+    user = dict(WARMUP_USER) | {"sub1": int(raw_id)}
+    serving_level = fast_features.build_feature_row(user, None)["sub1"]
+
+    assert training_levels[0] == serving_level == raw_id, (
+        f"train/serve skew is back: training produced {training_levels[0]!r}, "
+        f"serving sends {serving_level!r}"
+    )
+    # The null still means what it always meant.
+    assert training_levels[1] == "Other"
