@@ -237,6 +237,28 @@ slowest *and* materially different, so it is never the right choice here.)
 It is still 260 ms. On a landing page that is the whole budget, so `tabpfn_local` is the
 right backend for batch scoring and for teaching the surrogate, not for the funnel.
 
+### What the approximation costs
+
+Measured on **200 held-out users** — users the student never saw, so this is
+generalisation rather than memorisation:
+
+| | student vs teacher |
+|---|---|
+| same brand in position 1 | **100%** |
+| rank correlation over the whole list | 0.993 |
+| mean absolute error on the dollar figure | $3.97 |
+| mean absolute percentage error | 6.2% |
+| worst single-row error | $28.70 |
+
+The dollar estimates move by a few percent; the *order* does not. That asymmetry is the
+whole argument for the surrogate: revenue depends on which brand is first, not on the
+model's opinion of what that brand pays. These numbers are logged to MLflow on every
+run, so a retrain that degrades them is visible before it is deployed.
+
+`scripts/compare_backends.py` goes one step further and scores the same users through
+the whole endpoint twice, once with each backend, comparing the rankings themselves
+rather than the payout predictions behind them.
+
 ### The four backends
 
 - **`surrogate`** (default). TabPFN labels a large sample offline at training time —

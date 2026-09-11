@@ -112,6 +112,14 @@ different budgets:
 - **`catboost_fallback`** is availability: if TabPFN is unreachable the endpoint keeps
   answering rather than returning 503 while a user waits.
 
+**What it costs, measured.** On 200 held-out users the student picks the same brand for
+position one **100%** of the time, with a rank correlation of 0.993 over the whole list,
+while its dollar estimates are off by 6.2% on average. That asymmetry is the argument:
+revenue depends on which brand is first, not on the model's opinion of what that brand
+pays. The numbers are logged every run, so a retrain that degrades them is visible before
+it is deployed, and `scripts/compare_backends.py` re-checks the claim end to end by
+scoring the same users through both backends and comparing the rankings themselves.
+
 **The uncomfortable part, stated plainly.** The surrogate changes predictions. I did not
 want to hide that behind a config default, so: the distillation step measures itself
 against the teacher (MAE, MAPE, Spearman) and logs the result to MLflow on every run;
@@ -207,7 +215,7 @@ images.
 
 ## 6. How it runs in production
 
-**Sizing.** The training job peaks around 7.5 GB resident on the full two-month window:
+**Sizing.** The training job peaks around 9.5 GB resident on the full two-month window:
 2.4 GB of it is the names-dataset import, the rest is the 81k-row frame and the
 teacher-labelled distillation sample. That is what the cluster node type in
 `databricks.yml` is sized for. Serving is a different shape entirely — roughly 400 MB
