@@ -7,13 +7,15 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
-# Local runtime state (all reproducible from `make` targets)
-data/
-artifacts/
-mlruns/
-mlflow.db
-runs/
-loadtest/results/
+# Local runtime state (all reproducible from `make` targets).
+# Anchored with a leading slash: an unanchored `data/` also matches
+# src/bl_ranking/data/, which is source.
+/data/
+/artifacts/
+/mlruns/
+/mlflow.db
+/runs/
+/loadtest/results/
 *.log
 
 # TabPFN foundation weights (44 MB), fetched on demand.
