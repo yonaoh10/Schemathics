@@ -20,17 +20,16 @@ Four backends, selected by `model.payout.backend`. Measured on a 4-CPU box, one 
 being one user scored against 15 brands:
 
   surrogate         -> DEFAULT. A CatBoost student distilled from TabPFN's own
-                    predictions at training time. ~0.5 ms. On CPU it is the only option
-                    inside a page-load budget. It changes predictions, so the
-                    distillation step measures its own fidelity against the teacher -
-                    including how often it would pick a different brand for the top
-                    slot - and logs it on every run.
+                    predictions at training time. 0.8 ms against the teacher's 457 ms,
+                    for 1.21% of expected payout given up (measured end to end over 200
+                    users - see scripts/compare_backends.py). On CPU it is the only
+                    option inside a page-load budget.
   tabpfn_client     The research code's hosted model, with fit() lifted out of the
                     request path: the weekly job fits once and the serving process
                     reuses the server-side fitted set. Exact. One round trip per request.
-  tabpfn_local      TabPFN weights in-process. Exact and private, 260 ms per request
-                    with fit_with_cache - right for batch scoring or a GPU, not for the
-                    funnel.
+  tabpfn_local      TabPFN weights in-process. Exact and private, but 457 ms per
+                    request on CPU even with fit_with_cache - right for batch scoring,
+                    for teaching the surrogate, or on a GPU. Not for the funnel.
   catboost_fallback No TabPFN at all. The degraded path: it keeps the endpoint
                     answering when the others are unreachable, and it is what CI runs.
 
@@ -550,13 +549,16 @@ class SurrogateBackend(PayoutBackend):
                           n_users: int, n_brands: int) -> dict[str, float]:
         """How closely the student tracks the teacher. Logged as MLflow metrics.
 
-        Dollar error is the obvious measure and the least important one. What the
-        business sees is the order of the list, and specifically which brand lands in
-        the first position - so `surrogate_top1_agreement` is the number to watch, and
-        the one to alert on.
-
         Called on held-out users only (see fit), so these numbers describe how the
         student generalises rather than how well it memorised its own labels.
+
+        Read them as a regression detector, not as an estimate of production behaviour.
+        The sample is drawn from the payout context - rows a brand actually paid for -
+        which is a narrower, higher-value slice than live traffic, and these compare
+        *payout predictions* rather than the ranking those predictions produce. Measured
+        end to end over random users, top-1 agreement is 84.5%, not the ~100% this
+        reports. `scripts/compare_backends.py` is the honest estimate; this is the thing
+        that should scream if a retrain makes the student materially worse.
         """
         from scipy.stats import spearmanr
 

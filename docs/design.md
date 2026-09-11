@@ -26,10 +26,10 @@ digest moves.
 
 ---
 
-## 2. Dilemma 1 — "do not change the logic" versus a 54 ms feature pipeline
+## 2. Dilemma 1 — "do not change the logic" versus a 60 ms feature pipeline
 
 **What I found.** With the models already warm, one request through the research
-pipeline costs 54 ms p50, and almost none of it is arithmetic. It is pandas
+pipeline costs 60 ms p50 on the production model, and almost none of it is arithmetic. It is pandas
 per-operation overhead: a cross join, a DataFrame built from a dict, four
 `to_datetime` calls, a `Series.apply` that constructs a `pd.Series` per row for the
 gender feature, and about twenty `.loc[mask, col] = value` assignments across the four
@@ -38,7 +38,7 @@ band mappings. Roughly a hundred pandas calls to transform fifteen rows. The cos
 
 **The options.**
 
-1. Ship 54 ms and call it done. Defensible on the letter of the brief, indefensible on
+1. Ship 60 ms and call it done. Defensible on the letter of the brief, indefensible on
    "minimise latency as possible" — it is the entire budget for a page that is loading.
 2. Edit the transforms. Fastest to write, and exactly what the brief forbids.
 3. Write the same transformation a second way, and *prove* the two agree.
@@ -53,7 +53,8 @@ and requires identical brand order, identical ranks and identical expected payou
 caught two divergences I had not anticipated, both of which turned out to be real
 findings about the original code (§5).
 
-**Result: 54 ms to 1.8 ms**, with the original one environment variable away.
+**Result: 60.3 ms to 2.41 ms**, a factor of 25, with the original one environment
+variable away.
 
 Two things I deliberately did not do. I did not "improve" the band mappings whose
 overlapping `str.contains` branches look like bugs — `'$50,000 - $99,999'` matches the
@@ -78,15 +79,14 @@ a single brand is scored. Then a second round trip to predict. Per user.
 retrains. It changes only when Sunday's job changes it. So the fit belongs in the weekly
 job, and a request should pay for its own fifteen rows and nothing else.
 
-**Measured here** (4 CPU, 15 GB, context 1000x25, one request = 15 brand rows):
+**Measured here** (4 CPU, 15 GB, context 1000x25, one request = 15 brand rows). The
+three `fit_mode` rows hold `n_estimators=2` so that only the fit mode varies:
 
-| backend | start-up | per request | max diff vs the library default |
+| `tabpfn_local` `fit_mode` | start-up | payout prediction | max diff vs the library default |
 |---|---|---|---|
-| `tabpfn_local`, `low_memory` | 0.2 s | 37.3 s | $4.03 |
-| `tabpfn_local`, `fit_preprocessors` | 0.4 s | 8.69 s | reference |
-| `tabpfn_local`, `fit_with_cache` | 14.9 s | **0.26 s** | **$0.000045** |
-| `tabpfn_client`, fit reused | weekly | 1 network round trip | exact |
-| `surrogate` (CatBoost student) | 5 MB load | **~0.5 ms** | measured and logged |
+| `low_memory` | 0.2 s | 37.3 s | $4.03 |
+| `fit_preprocessors` (library default) | 0.4 s | 8.69 s | reference |
+| `fit_with_cache` | 14.9 s | **0.26 s** | **$0.000045** |
 
 `fit_with_cache` is a 33x improvement for predictions that differ by 4.5e-5 on payouts
 of $60-140 — the context is encoded once at start-up instead of on every call. It is the
@@ -94,7 +94,9 @@ largest exact-preserving win available and the research code leaves it on the ta
 `low_memory` is worth noting for the opposite reason: it is both the slowest mode and
 the only one that differs materially, so it is never the right choice here.
 
-It is still 260 ms on CPU.
+It does not rescue the request path. At the shipped teacher setting — `fit_with_cache`,
+`n_estimators=4` — a complete request measures **457 ms p50** over 200 users, against
+**2.41 ms** for the served path.
 
 **The decision.** A ladder, not a single answer, because different deployments have
 different budgets:
@@ -112,13 +114,40 @@ different budgets:
 - **`catboost_fallback`** is availability: if TabPFN is unreachable the endpoint keeps
   answering rather than returning 503 while a user waits.
 
-**What it costs, measured.** On 200 held-out users the student picks the same brand for
-position one **100%** of the time, with a rank correlation of 0.993 over the whole list,
-while its dollar estimates are off by 6.2% on average. That asymmetry is the argument:
-revenue depends on which brand is first, not on the model's opinion of what that brand
-pays. The numbers are logged every run, so a retrain that degrades them is visible before
-it is deployed, and `scripts/compare_backends.py` re-checks the claim end to end by
-scoring the same users through both backends and comparing the rankings themselves.
+**What it costs, measured — and a lesson about which metric to trust.** The training
+job logs the student against the teacher on held-out users: rank correlation 0.993,
+dollar error 6.2%, the same top brand every time. I did not believe that last figure,
+because the distillation sample is drawn from the payout context — rows that were
+actually paid for — and it compares payout predictions rather than the ranking they
+produce. So I measured the thing itself: 200 randomly generated users, scored through
+the whole endpoint twice.
+
+| | surrogate vs teacher |
+|---|---|
+| same brand in position 1 | 84.5% |
+| same top 3, as a set | 82.0% |
+| identical ordering of all 15 | 3.5% |
+| **expected payout given up, mean over all users** | **1.21%** |
+| ... when they disagree | 7.83% |
+| ... worst single user | 27.8% |
+| latency | 4.1 ms vs 456.7 ms |
+
+The agreement rows are the wrong thing to read. They treat "picked a brand worth two
+cents less" the same as "picked a much worse brand". The regret row asks what the
+student's choice is worth *under the teacher's own scores*: the student disagrees about
+first position for roughly one user in six, and when it does it gives up about 8% of
+that user's expected payout — 1.21% averaged over everyone.
+
+**So the trade is 1.21% of expected payout per session against 450 ms of added page
+latency.** Which side wins depends on the funnel's latency-to-conversion curve, which
+the business has and I do not. I defaulted to the surrogate because 450 ms on a landing
+page is very likely to cost more than 1.2% of revenue — but the whole point of measuring
+it this way is that someone with the conversion data can overturn the default with one
+environment variable.
+
+It also changed how I think about the logged metric. `surrogate_top1_agreement` at
+training time is a regression detector, not an estimate of production behaviour; the
+end-to-end script is the estimate. Both are kept, labelled for what they are.
 
 **The uncomfortable part, stated plainly.** The surrogate changes predictions. I did not
 want to hide that behind a config default, so: the distillation step measures itself
@@ -277,8 +306,10 @@ two scripts are near-duplicate code, and a single shared implementation would re
 whole class of skew. Rejected: it is the change the brief explicitly forbids. The
 equivalence test gets most of the benefit — it *proves* the two agree — without the edit.
 
-**Keep the models loaded but leave the pipeline alone.** This was the first version:
-54 ms to 12 ms, entirely by hoisting start-up work. Good, and not enough for a page load.
+**Keep the models loaded but leave the pipeline alone.** This was the first version,
+and it is worth roughly a fifth of the total: hoisting start-up work removes the
+per-request model loading, but the ~60 ms of pandas overhead in the feature pipeline is
+untouched by it. Good, and nowhere near enough for a page load.
 
 **Reduce TabPFN's `n_estimators`.** Cheap and tempting. Measured, it reorders brands —
 Spearman against the default is below 1.0 — and brand order is the output that matters.

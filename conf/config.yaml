@@ -52,8 +52,8 @@ model:
     #   tabpfn_client     the research code's hosted API, with fit() lifted out of the
     #                     request path. Exact. One network round trip per request.
     #                     Needs TABPFN_TOKEN.
-    #   tabpfn_local      TabPFN weights in-process. Exact, no network, but ~5 s per
-    #                     request on CPU - batch scoring only, unless on GPU.
+    #   tabpfn_local      TabPFN weights in-process. Exact, no network, but ~457 ms
+    #                     per request on CPU - batch scoring only, unless on GPU.
     #   catboost_fallback no TabPFN at all. The degraded path when the others are
     #                     unreachable, and what CI runs.
     #
@@ -74,7 +74,7 @@ model:
     model_path: null
     # Teacher-labelled rows the student is fitted on. TabPFN costs ~12-17 ms per row
     # on CPU, so 15k rows adds roughly four minutes to the weekly job - paid once a
-    # week to save ~260 ms on every request for the following week.
+    # week to save ~455 ms on every request for the following week.
     surrogate_sample_rows: 20000
 
 mlflow:

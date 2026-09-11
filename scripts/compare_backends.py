@@ -101,6 +101,7 @@ def main() -> None:
 
     users = random_users(args.users)
     top1 = top3 = full = scored = 0
+    regrets: list[float] = []
     student_ms: list[float] = []
     teacher_ms: list[float] = []
 
@@ -121,16 +122,33 @@ def main() -> None:
         top1 += order_a[0] == order_b[0]
         top3 += set(order_a[:3]) == set(order_b[:3])
         full += order_a == order_b
+
+        # The number that decides whether the disagreements matter. Agreement counts
+        # treat "picked a brand worth $0.02 less" the same as "picked a much worse
+        # brand". Regret does not: it asks what the student's choice is worth *under
+        # the teacher's own scores*, relative to the teacher's own pick.
+        best = b[order_b[0]]["expected_payout"]
+        chosen = b.get(order_a[0], {}).get("expected_payout", 0.0)
+        if best > 0:
+            regrets.append((best - chosen) / best)
+
         if i % 25 == 0:
             print(f"  {i}/{len(users)} ...", flush=True)
 
     student_ms.sort()
     teacher_ms.sort()
+    regrets.sort()
+    disagreements = [r for r in regrets if r > 0]
     result = {
         "users_scored": scored,
         "top1_agreement": round(top1 / scored, 4) if scored else None,
         "top3_set_agreement": round(top3 / scored, 4) if scored else None,
         "full_order_agreement": round(full / scored, 4) if scored else None,
+        "mean_regret": round(sum(regrets) / len(regrets), 5) if regrets else None,
+        "p95_regret": round(regrets[int(len(regrets) * 0.95)], 5) if regrets else None,
+        "max_regret": round(regrets[-1], 5) if regrets else None,
+        "mean_regret_when_disagreeing": (
+            round(sum(disagreements) / len(disagreements), 5) if disagreements else 0.0),
         "student_p50_ms": round(student_ms[len(student_ms) // 2], 3) if student_ms else None,
         "teacher_p50_ms": round(teacher_ms[len(teacher_ms) // 2], 1) if teacher_ms else None,
         "bundle": str(bundle),
@@ -142,6 +160,13 @@ def main() -> None:
     print(f"same brand in position 1   {result['top1_agreement']:.1%}")
     print(f"same top 3 (as a set)      {result['top3_set_agreement']:.1%}")
     print(f"identical full ordering    {result['full_order_agreement']:.1%}")
+    print()
+    print("expected-payout regret (student's pick, scored by the teacher):")
+    print(f"  mean over all users      {result['mean_regret']:.2%}")
+    print(f"  mean when they disagree  {result['mean_regret_when_disagreeing']:.2%}")
+    print(f"  p95                      {result['p95_regret']:.2%}")
+    print(f"  worst single user        {result['max_regret']:.2%}")
+    print()
     print(f"surrogate p50              {result['student_p50_ms']:.2f} ms")
     print(f"teacher   p50              {result['teacher_p50_ms']:.1f} ms")
     speedup = result["teacher_p50_ms"] / result["student_p50_ms"]
