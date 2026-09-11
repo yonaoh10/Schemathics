@@ -20,10 +20,11 @@ Four backends, selected by `model.payout.backend`. Measured on a 4-CPU box, one 
 being one user scored against 15 brands:
 
   surrogate         -> DEFAULT. A CatBoost student distilled from TabPFN's own
-                    predictions at training time. 0.8 ms against the teacher's 457 ms,
-                    for 1.21% of expected payout given up (measured end to end over 200
-                    users - see scripts/compare_backends.py). On CPU it is the only
-                    option inside a page-load budget.
+                    predictions at training time. A whole request costs 4.1 ms
+                    against the teacher's 457 ms - both measured end to end over the
+                    same 200 users - for 1.21% of expected payout given up (see
+                    scripts/compare_backends.py). On CPU it is the only option inside
+                    a page-load budget.
   tabpfn_client     The research code's hosted model, with fit() lifted out of the
                     request path: the weekly job fits once and the serving process
                     reuses the server-side fitted set. Exact. One round trip per request.
