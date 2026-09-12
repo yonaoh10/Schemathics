@@ -424,9 +424,21 @@ whole function into a table that ships inside the model bundle:
 | `NameDataset()` | 18.6 s | 2.4 GB | 77 µs |
 | precomputed table | 3.9 s | 290 MB | 0.09 µs |
 
-Names the table does not contain return `('unknown', 0.0)` — exactly what the research
-implementation returns for a name the dataset does not know — so the table is exact by
-construction. `tests/test_gender_lut.py` checks it against the live dataset.
+The table is keyed by what the serving path actually looks up. The research code does
+`str(x).strip().capitalize()` before the lookup, and `capitalize()` lowercases
+everything after the first letter, so "Anne-Marie" is asked for as "Anne-marie".
+names-dataset normalises internally and still finds it; a table keyed on the dataset's
+own spelling did not. 102,602 of the 727,556 names — every hyphenated and multi-word
+first name among them — differ from their own capitalisation, and each one silently
+returned `unknown`. Building each entry by asking the research function with the
+capitalised key makes the table exact, because that is the same question serving asks.
+
+Names the table does not contain return `('unknown', 0.0)`, which is what the research
+implementation returns for a name the dataset does not know.
+`tests/test_gender_lut.py` checks both, through the serving key, and deliberately
+samples the names that differ under capitalisation — the earlier version compared raw
+dataset spellings on both sides, so it exercised a path production never takes and
+stayed green while 14% of the dataset missed.
 
 The serving image therefore does not install `names-dataset` at all, and the research
 predictor module is imported lazily so a default serving process never touches it.

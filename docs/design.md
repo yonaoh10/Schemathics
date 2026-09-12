@@ -319,8 +319,16 @@ Rejected as a silent knob; it stays configurable and documented.
 **Keep `names-dataset` and share it across workers with a preloading fork.** Would cut
 the 2.4 GB from N copies to roughly one. Rejected: it is a workaround for a cost that can
 be removed entirely. Materialising the gender function into a 4 MB table makes the
-serving image not need the library at all, and it is exact by construction because the
-name universe is finite.
+serving image not need the library at all, and it is exact because the name universe is
+finite and each entry is built by asking the research function itself.
+
+That last part took two goes. The first table was keyed by the dataset's own spelling,
+while the research code looks names up as `str(x).strip().capitalize()` - which
+lowercases everything after the first letter. names-dataset normalises internally so it
+still found "Anne-Marie" behind "Anne-marie"; a plain dict did not. 102,602 of 727,556
+names differ from their own capitalisation, so 14% of the table silently answered
+`unknown`, and the test missed it by comparing raw spellings on both sides rather than
+the key serving actually uses.
 
 **Serve the MLflow pyfunc directly instead of FastAPI.** Simpler, and the pyfunc is
 registered with every model version, so `mlflow models serve -m models:/bl_brand_ranker@champion`

@@ -92,11 +92,26 @@ class GenderLookup:
         genders: list[str] = []
         confidences: list[float] = []
 
+        # Key by what the serving path looks up, not by the dataset's own spelling.
+        #
+        # The research code does `str(x).strip().capitalize()` before the lookup, and
+        # `capitalize()` lowercases everything after the first letter. names-dataset
+        # normalises internally so `search("Anne-marie")` still finds "Anne-Marie", but
+        # a dict keyed on the raw spelling does not: 102,602 of its 727,556 names -
+        # every hyphenated and multi-word first name among them - differ from their own
+        # capitalisation and silently missed. Building on the capitalised key and
+        # asking `_detect` with that exact key makes the table exact by construction,
+        # because it is the same question serving asks.
+        seen: set[str] = set()
         for name in dataset.first_names:
-            gender, confidence = _detect(dataset, name)
+            key = str(name).strip().capitalize()
+            if key in seen:
+                continue
+            seen.add(key)
+            gender, confidence = _detect(dataset, key)
             if (gender, confidence) == UNKNOWN:
                 continue  # identical to the miss path; storing it would only add size
-            names.append(name)
+            names.append(key)
             genders.append(gender)
             confidences.append(confidence)
 

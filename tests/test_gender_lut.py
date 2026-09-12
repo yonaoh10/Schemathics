@@ -55,7 +55,19 @@ def _research_implementation(dataset, fname):
     return "female", round(f / total, 3)
 
 
+def _serving_key(name):
+    """Exactly what the research pipeline passes to the lookup: str.strip().capitalize()."""
+    return str(name).strip().capitalize()
+
+
 def test_table_matches_the_research_function_on_a_random_sample(built_table, live_dataset):
+    """Compared through the SERVING key, which is the only lookup that happens.
+
+    This test used to pass the raw dataset spelling to both sides, so it exercised a
+    path production never takes and stayed green while 14% of the dataset silently
+    missed: `capitalize()` lowercases everything after the first letter, so
+    "Anne-Marie" is looked up as "Anne-marie", which was not a key in the table.
+    """
     import random
 
     table, _ = built_table
@@ -64,16 +76,42 @@ def test_table_matches_the_research_function_on_a_random_sample(built_table, liv
 
     mismatches = []
     for name in rng.sample(names, 4000):
-        expected = _research_implementation(live_dataset, name)
-        if table.lookup(name) != expected:
-            mismatches.append((name, table.lookup(name), expected))
+        key = _serving_key(name)
+        expected = _research_implementation(live_dataset, key)
+        if table.lookup(key) != expected:
+            mismatches.append((name, key, table.lookup(key), expected))
     assert mismatches == [], mismatches[:10]
 
 
-@pytest.mark.parametrize("name", ["Michael", "Jennifer", "Rigoberto", "Maria", "Svetlana"])
+def test_names_whose_capitalisation_differs_are_not_silently_unknown(built_table, live_dataset):
+    """The 14% of names the old key scheme dropped: hyphenated and multi-word ones.
+
+    Sampled deliberately rather than at random, because a uniform sample of 4000 hits
+    few of them and none of the ones a reviewer would think to try.
+    """
+    import random
+
+    table, _ = built_table
+    rng = random.Random(4242)
+    awkward = [n for n in rng.sample(list(live_dataset.first_names.keys()), 60000)
+               if isinstance(n, str) and n != n.capitalize()][:1500]
+    assert awkward, "expected the dataset to contain names that differ under capitalize()"
+
+    mismatches = []
+    for name in awkward + ["Anne-Marie", "Jean-Luc", "Mary Ann", "O'Brien"]:
+        key = _serving_key(name)
+        expected = _research_implementation(live_dataset, key)
+        if table.lookup(key) != expected:
+            mismatches.append((name, key, table.lookup(key), expected))
+    assert mismatches == [], mismatches[:10]
+
+
+@pytest.mark.parametrize("name", ["Michael", "Jennifer", "Rigoberto", "Maria",
+                                  "Svetlana", "Anne-Marie", "Jean-Luc"])
 def test_known_names_match(built_table, live_dataset, name):
     table, _ = built_table
-    assert table.lookup(name) == _research_implementation(live_dataset, name)
+    key = _serving_key(name)
+    assert table.lookup(key) == _research_implementation(live_dataset, key)
 
 
 @pytest.mark.parametrize("name", ["Zzzqqxwv", "", "Nan", "None", "12345"])
@@ -81,9 +119,10 @@ def test_unknown_names_return_the_same_default(built_table, live_dataset, name):
     """'Nan' and 'None' are real keys: `str(x).strip().capitalize()` produces them for a
     missing name, so the miss path has to behave identically."""
     table, _ = built_table
-    assert table.lookup(name) == _research_implementation(live_dataset, name)
-    if table.lookup(name) == UNKNOWN:
-        assert _research_implementation(live_dataset, name) == UNKNOWN
+    key = _serving_key(name)
+    assert table.lookup(key) == _research_implementation(live_dataset, key)
+    if table.lookup(key) == UNKNOWN:
+        assert _research_implementation(live_dataset, key) == UNKNOWN
 
 
 def test_table_round_trips_through_parquet(built_table):
