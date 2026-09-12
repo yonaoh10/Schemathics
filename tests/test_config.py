@@ -95,3 +95,46 @@ def test_an_empty_override_is_ignored_not_fatal(monkeypatch, key):
     assert settings.serving.workers == 3
     assert settings.model.payout.backend in {"surrogate", "catboost_fallback"}
 
+def test_a_config_path_that_is_not_a_file_says_so(monkeypatch, tmp_path):
+    """BL_CONFIG pointing at a directory used to raise a bare IsADirectoryError."""
+    directory = tmp_path / "conf"
+    directory.mkdir()
+    monkeypatch.setenv("BL_CONFIG", str(directory))
+    with pytest.raises(IsADirectoryError, match="BL_CONFIG"):
+        Settings.load()
+
+
+def test_a_config_file_that_is_not_a_mapping_says_so(monkeypatch, tmp_path):
+    """A YAML list parsed fine and then silently gave every setting its default."""
+    path = tmp_path / "config.yaml"
+    path.write_text("- a\n- b\n")
+    monkeypatch.setenv("BL_CONFIG", str(path))
+    with pytest.raises(ValueError, match="mapping of settings"):
+        Settings.load()
+
+
+def test_a_missing_config_file_is_still_fine(monkeypatch, tmp_path):
+    """Every setting has a default and the effective config is logged either way."""
+    monkeypatch.setenv("BL_CONFIG", str(tmp_path / "absent.yaml"))
+    assert Settings.load().serving.port == 8080
+
+
+@pytest.mark.parametrize("variable", ["BL_SERVING", "BL_MODEL"])
+def test_overriding_a_whole_block_with_a_scalar_names_the_mistake(monkeypatch, variable):
+    """It replaced the dataclass with a string.
+
+    The failure then surfaced far away as "'str' object has no attribute 'workers'",
+    which names neither the variable nor what to do about it.
+    """
+    import os
+
+    # A session fixture elsewhere sets BL_MODEL__PAYOUT__BACKEND, which would trip the
+    # nested-collision check first and test a different rule than this one claims to.
+    for key in list(os.environ):
+        if key.startswith(f"{variable}__"):
+            monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv(variable, "x")
+    with pytest.raises(ValueError, match="group of settings"):
+        Settings.load()
+

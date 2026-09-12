@@ -91,8 +91,6 @@ serving:
   # Threads each worker may use for CatBoost / torch. workers * threads should not
   # exceed the core count or p99 collapses under contention.
   threads_per_worker: 1
-  # Reject requests that would queue longer than this (fail fast, the user is waiting).
-  request_timeout_ms: 1500
   # Load models from the registry at start-up; falls back to a local run directory.
   model_uri: null               # null -> models:/<registered_model>@<serving_alias>
   # fast     - vectorised feature path, ~50ms of pandas overhead removed (default)

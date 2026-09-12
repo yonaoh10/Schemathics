@@ -120,7 +120,6 @@ class ServingSettings:
     port: int = 8080
     workers: int = 3
     threads_per_worker: int = 1
-    request_timeout_ms: int = 1500
     model_uri: str | None = None
     # "fast" (default) or "research". See serving/fast_features.py.
     feature_path: str = "fast"
@@ -212,9 +211,29 @@ def _abs(value: str | Path) -> Path:
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
+    """Load a config file, or say clearly why it could not be loaded.
+
+    A missing file is fine - every setting has a default and the effective config is
+    logged to MLflow either way. A path that exists but is not a usable config file is
+    not, and used to surface as a raw IsADirectoryError or a type error from deep
+    inside the dataclass builder, naming neither BL_CONFIG nor the path it was given.
+    """
     if not path.exists():
         return {}
-    return yaml.safe_load(path.read_text()) or {}
+    if path.is_dir():
+        raise IsADirectoryError(
+            f"config path {path} is a directory, not a file. BL_CONFIG must name "
+            f"conf/config.yaml itself."
+        )
+    loaded = yaml.safe_load(path.read_text())
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"config file {path} must contain a mapping of settings at the top level, "
+            f"got {type(loaded).__name__}."
+        )
+    return loaded
 
 
 def env_override_keys() -> frozenset[str]:
@@ -308,6 +327,16 @@ def _build(cls: type, raw: dict[str, Any], path: str = "") -> Any:
         where = f"{path}.{f.name}" if path else f.name
         if is_dataclass(current) and isinstance(value, dict):
             setattr(instance, f.name, _build(type(current), value, where))
+        elif is_dataclass(current):
+            # BL_SERVING=x names a whole block, not a setting. Left alone it replaced
+            # the dataclass with a string, and the failure surfaced much later as
+            # "'str' object has no attribute 'workers'", naming nothing useful.
+            raise ValueError(
+                f"{where} is a group of settings, not a single value; got {value!r}. "
+                f"Set one of its members instead, e.g. "
+                f"{ENV_PREFIX}{where.upper().replace('.', NESTING_SEPARATOR)}"
+                f"{NESTING_SEPARATOR}<SETTING>."
+            )
         else:
             setattr(instance, f.name, _as_field_type(value, current, where, f.type))
     return instance
