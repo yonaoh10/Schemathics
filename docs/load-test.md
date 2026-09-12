@@ -4,7 +4,12 @@ Reproduce with:
 
 ```bash
 make serve                      # in one terminal
-make loadtest                   # in another
+make loadtest                   # in another: the sweep, three times over for the tables below
+
+# and the two single-rate holds, which are what separate a steady state from a backlog
+# that had not filled yet:
+python loadtest/run_load.py --rps 250 --duration 60 --warmup 5 --processes 3
+python loadtest/run_load.py --rps 300 --duration 60 --warmup 5 --processes 3
 ```
 
 ## Method
@@ -143,8 +148,8 @@ cores, because the work is CPU-bound and scales by process.
 **Operating point.** At 100 rps — comfortably inside capacity — p50 is 9.8 ms and p99 is
 21.3 ms end to end, with the handler itself at 6.6 ms p50. The two gaps are worth keeping
 apart. `X-Process-Time-Ms` is stamped by the outermost middleware, so it already contains
-body parsing and Pydantic validation: against 2.8 ms of scoring measured in-process, about
-half of that 6.6 ms is the HTTP layer. The 3.2 ms beyond the header is loopback, connection
+body parsing and Pydantic validation: against 2.8 ms of scoring measured in-process, 3.8 of
+those 6.6 ms are the HTTP layer. The 3.2 ms beyond the header is loopback, connection
 handling and OS queueing across three workers sharing four cores with the load generator, of
 which 0.8 ms is the generator's own send lag.
 
@@ -198,13 +203,15 @@ The choice of payout backend dominates everything else, which is why the surroga
 
 | backend | payout prediction | total request |
 |---|---|---|
-| `surrogate` / `catboost_fallback` | 0.91 ms | 2.77 ms |
+| `surrogate` / `catboost_fallback` | 0.91 ms | 2.81 ms |
 | `tabpfn_local`, `fit_with_cache`, `n_estimators=4` (exact) | ~455 ms | 457 ms |
 | `tabpfn_local`, `fit_with_cache`, `n_estimators=2` | 260 ms | ~262 ms |
 | `tabpfn_local`, `fit_preprocessors`, `n_estimators=2` | 8,690 ms | ~8,692 ms |
 | `tabpfn_client` | one network round trip | request + RTT |
 
-The 457 ms is end to end over 200 users through the whole ranker; the `n_estimators=2` rows
-come from the `fit_mode` comparison, which holds the ensemble size fixed so that the only
+Both columns are over 200 distinct users: the payout column is that stage alone, the total
+is `ranker.rank()` end to end, which is why the first row's 2.81 ms matches the table above
+rather than its 2.77 ms sum of stages. The `n_estimators=2` rows come from the `fit_mode`
+comparison, which holds the ensemble size fixed so that the only
 variable is the fit mode. See the README section "Productizing TabPFN" for how those were
 measured and what the trade-off costs in accuracy.
