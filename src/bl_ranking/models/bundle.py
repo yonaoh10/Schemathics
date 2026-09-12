@@ -34,6 +34,9 @@ CLIENTS_FILE = "all_clients.csv"
 MANIFEST_FILE = "manifest.json"
 GENDER_LOOKUP_FILE = "gender_lookup.parquet"   # models/gender_lut.ARTIFACT_NAME
 
+# The single column all_clients.csv carries, and the name the research code joins on.
+CLIENT_NAME_COLUMN = "client_name"
+
 
 @dataclass
 class Manifest:

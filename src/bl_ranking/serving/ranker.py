@@ -148,13 +148,7 @@ class BrandRanker:
                 ) from exc
 
         all_clients = pd.read_csv(directory / bundle_files.CLIENTS_FILE)
-        if all_clients.empty:
-            # Every request would return 200 with an empty ranking while /readyz stayed
-            # green: a total outage that looks like a healthy service from the outside.
-            raise ValueError(
-                f"Model bundle at {directory} has an empty brand universe "
-                f"({bundle_files.CLIENTS_FILE}); there is nothing to rank."
-            )
+        _assert_usable_brand_universe(all_clients, directory)
 
         install_warning_capture()
         warm = WarmModels(
@@ -290,6 +284,51 @@ def install_warning_capture() -> None:
     _warning_capture_installed = True
 
 
+
+
+def _assert_usable_brand_universe(all_clients: pd.DataFrame, directory: Path) -> None:
+    """Refuse a brand universe that cannot produce an honest ranking.
+
+    Three ways it used to go wrong, all of them quietly:
+
+    * Empty. Every request returned 200 with an empty ranking while /readyz stayed
+      green - a total outage that looks like a healthy service from outside.
+    * A null or blank name. pandas reads it back as NaN, `str()` makes it the literal
+      "nan", and the endpoint offers the funnel a lender by that name.
+    * Duplicates. The cross join produces the brand twice, the ranking collapses it to
+      one entry, and the response then has fewer brands than the bundle claims - with
+      no rank 1 in some orderings.
+    """
+    column = bundle_files.CLIENT_NAME_COLUMN
+    if column not in all_clients.columns:
+        raise ValueError(
+            f"Model bundle at {directory}: {bundle_files.CLIENTS_FILE} has no "
+            f"{column!r} column; columns present are {list(all_clients.columns)}."
+        )
+
+    names = all_clients[column]
+    blank = names.isna() | (names.astype(str).str.strip() == "")
+    if blank.any():
+        raise ValueError(
+            f"Model bundle at {directory}: {bundle_files.CLIENTS_FILE} has "
+            f"{int(blank.sum())} blank brand name(s), which would be served as a "
+            f"lender literally called 'nan'."
+        )
+
+    usable = names.astype(str).str.strip()
+    if usable.empty:
+        raise ValueError(
+            f"Model bundle at {directory} has an empty brand universe "
+            f"({bundle_files.CLIENTS_FILE}); there is nothing to rank."
+        )
+
+    duplicated = usable[usable.duplicated()].unique()
+    if len(duplicated):
+        raise ValueError(
+            f"Model bundle at {directory}: {bundle_files.CLIENTS_FILE} lists "
+            f"{list(duplicated)[:5]} more than once. Duplicates collapse in the "
+            f"ranking, so the response would carry fewer brands than the bundle has."
+        )
 
 def _assert_columns_match_the_classifier(
     catboost: CatBoostClassifier, columns: list[str], directory: Path

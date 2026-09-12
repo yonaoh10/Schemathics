@@ -67,22 +67,32 @@ def resolve_bundle(settings: Settings) -> Path:
         return _latest_local_bundle(settings)
 
 
-# Schemes that mean "a registry someone else administers", as opposed to a directory
-# of files sitting next to this process.
-_REMOTE_TRACKING_SCHEMES = ("http://", "https://", "databricks")
-
-
 def _registry_is_authoritative(settings: Settings) -> bool:
-    """True when this process is pointed at a tracking server rather than a local store.
+    """True unless this process is pointed at a plain directory of files.
 
     The distinction is the whole point. A file store under the repository is the
-    offline development case the local fallback exists for, and pointing at one is
-    not a statement about which version should be serving. A tracking server is: its
-    alias is an operator's decision, so when it cannot be reached this worker has
-    nothing to fall back *to* that would not contradict that decision.
+    offline development case the local fallback exists for, and pointing at one is not
+    a statement about which version should be serving. Anything else - a tracking
+    server, or any of the database backends MLflow supports - is administered, and its
+    alias is an operator's decision, so a worker that cannot read it has nothing to
+    fall back *to* that would not contradict that decision.
+
+    Written as "not a file store" rather than as a list of remote schemes, because the
+    list is the part that goes stale: an earlier version named http, https and
+    databricks, which silently left the rollback-undoing fallback live for every
+    postgresql://, mysql:// and sqlite:// registry - the ordinary production setups.
     """
-    uri = str(settings.mlflow.resolved_tracking_uri()).strip().lower()
-    return uri.startswith(_REMOTE_TRACKING_SCHEMES)
+    uri = str(settings.mlflow.resolved_tracking_uri()).strip()
+    if not uri:
+        return False
+    # MLflow's Databricks URIs are the one form with no scheme separator: the literal
+    # "databricks", or "databricks://<profile>".
+    if uri.lower() == "databricks" or uri.lower().startswith("databricks:"):
+        return True
+    scheme, separator, _ = uri.partition("://")
+    if not separator:
+        return False          # a bare path is a local directory
+    return scheme.lower() != "file"
 
 
 def _from_uri(uri: str, settings: Settings) -> Path:

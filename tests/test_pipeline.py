@@ -502,6 +502,35 @@ def test_one_unrepresentable_id_does_not_corrupt_the_rest_of_its_column():
     assert phones[1] == 7869914030
     assert repairs["cellphone"] == 1
 
+@pytest.mark.parametrize("names,expected", [
+    ([None], "blank brand name"),
+    ([""], "blank brand name"),
+    (["sba central", "sba central"], "more than once"),
+    ([], "empty brand universe"),
+])
+def test_a_degenerate_brand_universe_is_refused(bundle, settings, tmp_path, names, expected):
+    """Each of these used to load and serve something wrong rather than nothing.
+
+    A null name comes back from pandas as NaN and reaches the funnel as a lender
+    literally called 'nan'. Duplicates collapse in the ranking, so the response carries
+    fewer brands than the bundle claims.
+    """
+    import shutil
+
+    import pandas as pd
+
+    from bl_ranking.models import bundle as bundle_files
+    from bl_ranking.serving.ranker import BrandRanker
+
+    damaged = tmp_path / "bundle"
+    shutil.copytree(bundle, damaged)
+    pd.DataFrame({bundle_files.CLIENT_NAME_COLUMN: names}).to_csv(
+        damaged / bundle_files.CLIENTS_FILE, index=False)
+
+    with pytest.raises(ValueError, match=expected):
+        BrandRanker.load(damaged, settings)
+
+
 def test_a_bundle_with_no_brands_is_refused(bundle, settings, tmp_path):
     """An empty brand universe used to be a silent total outage.
 
@@ -626,4 +655,24 @@ def test_one_malformed_cell_does_not_fail_the_whole_pyfunc_batch(bundle, setting
     assert len(frame) == 3
     assert frame["error"][0] is None and frame["error"][2] is None
     assert frame["error"][1] is not None
+
+@pytest.mark.parametrize("uri,authoritative", [
+    ("http://mlflow:5000", True),
+    ("databricks", True),
+    ("postgresql://user@host/mlflow", True),
+    ("sqlite:////var/lib/mlflow.db", True),
+    ("file:///tmp/mlruns", False),
+    ("/tmp/mlruns", False),
+])
+def test_every_registry_backend_counts_as_authoritative(settings, monkeypatch, uri, authoritative):
+    """Only a plain directory of files is the offline case the fallback is for.
+
+    An earlier version listed the remote schemes it knew - http, https, databricks -
+    which silently left the rollback-undoing fallback live for every postgresql://,
+    mysql:// and sqlite:// registry, which are the ordinary production setups.
+    """
+    from bl_ranking.serving.model_source import _registry_is_authoritative
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    assert _registry_is_authoritative(settings) is authoritative
 
