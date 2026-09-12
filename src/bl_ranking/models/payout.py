@@ -550,7 +550,12 @@ class SurrogateBackend(PayoutBackend):
         if len(brands) == 0:
             return x.copy(), len(x), 1
 
-        target_rows = max(self.cfg.surrogate_sample_rows, len(x))
+        # The setting is the target, not a floor. Written as max(setting, len(x)) it
+        # could only ever raise the row count: asking for fewer rows to make a run
+        # faster was silently ignored for any value at or below the context size, which
+        # is every value someone would choose for that purpose. The floor that does
+        # matter is one row per brand, and it is applied below.
+        target_rows = self.cfg.surrogate_sample_rows
         per_brand = max(1, target_rows // len(brands))
         base = x.sample(n=min(per_brand, len(x)), random_state=42,
                         replace=per_brand > len(x))

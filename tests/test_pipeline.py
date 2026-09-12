@@ -949,3 +949,28 @@ def test_a_manifest_from_a_different_version_still_loads(bundle, settings, tmp_p
 
     assert BrandRanker.load(other, settings) is not None
 
+@pytest.mark.parametrize("asked,at_least,at_most", [(500, 400, 600), (5000, 4500, 5100)])
+def test_the_distillation_sample_size_setting_can_lower_the_row_count(asked, at_least, at_most):
+    """It was written as max(setting, len(context)), so it could only raise the count.
+
+    Every value someone would pick to make a run faster sits at or below the context
+    size, which is exactly the range the floor swallowed - so the knob appeared to do
+    nothing at all in the only direction anyone turns it.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from bl_ranking.config import PayoutSettings
+    from bl_ranking.models.payout import SurrogateBackend
+
+    context = pd.DataFrame({
+        "client_name": [f"b{i % 15}" for i in range(1000)],
+        "feature": np.arange(1000),
+    })
+    backend = SurrogateBackend(PayoutSettings(surrogate_sample_rows=asked))
+    sample, users, brands = backend._distillation_sample(context)
+
+    assert at_least <= len(sample) <= at_most
+    assert brands == 15
+    assert users >= 1, "every brand must still get at least one row"
+
