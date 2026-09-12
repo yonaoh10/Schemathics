@@ -83,9 +83,43 @@ def parse_quartz(expression: str) -> CronFields:
     # Quartz requires exactly one of day-of-month / day-of-week to be '?'.
     # APScheduler has no '?', so it becomes '*'.
     day = "*" if day == "?" else day
-    day_of_week = "*" if day_of_week == "?" else _DAY_ALIASES.get(day_of_week.upper(), day_of_week.lower())
+    day_of_week = "*" if day_of_week == "?" else _translate_day_of_week(day_of_week)
     return CronFields(second=second, minute=minute, hour=hour, day=day,
                       month=month, day_of_week=day_of_week)
+
+
+# Quartz numbers days 1=SUN..7=SAT; APScheduler numbers 0=MON..6=SUN. Passing a number
+# through unchanged therefore moves the schedule by two days without any error - a
+# weekly retrain configured as '1' for Sunday would have run on Tuesday. Both systems
+# accept the same three-letter names, so numbers are translated into names and the
+# ambiguity disappears.
+_QUARTZ_DAY_NUMBERS = {1: "sun", 2: "mon", 3: "tue", 4: "wed", 5: "thu", 6: "fri", 7: "sat"}
+
+
+def _translate_day_of_week(field: str) -> str:
+    """Render a Quartz day-of-week in a form APScheduler reads identically."""
+    text = field.strip()
+    if text in {"*", ""}:
+        return "*"
+
+    def one(token: str) -> str:
+        token = token.strip()
+        if token.isdigit():
+            number = int(token)
+            if number not in _QUARTZ_DAY_NUMBERS:
+                raise ValueError(
+                    f"{field!r} is not a Quartz day-of-week: {number} is outside 1-7 "
+                    f"(1=SUN .. 7=SAT)"
+                )
+            return _QUARTZ_DAY_NUMBERS[number]
+        name = _DAY_ALIASES.get(token.upper(), token.lower())
+        if name not in set(_QUARTZ_DAY_NUMBERS.values()):
+            raise ValueError(f"{field!r} is not a Quartz day-of-week: {token!r}")
+        return name
+
+    # Lists and ranges, e.g. '2-6' (Quartz MON-FRI) or 'MON,WED'.
+    return ",".join("-".join(one(edge) for edge in part.split("-"))
+                    for part in text.split(","))
 
 
 def run_scheduler(settings: Settings | None = None, run_now: bool = False) -> None:

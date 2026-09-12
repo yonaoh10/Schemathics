@@ -847,3 +847,78 @@ def test_a_payout_model_with_the_wrong_column_order_is_refused(bundle, settings)
 
     with pytest.raises(ValueError, match="mis-slot"):
         _assert_payout_columns_match(Shorter(), columns, bundle)
+
+def test_an_entirely_null_column_does_not_break_ingestion(tmp_path, settings):
+    """A quiet window has no conversions, and conversion_dt is then wholly null.
+
+    Arrow infers the `Null` type for an empty column and Delta rejects it outright -
+    "Invalid data type for Delta Lake: Null" - failing the whole ingestion with a
+    message that names neither the column nor the file. It is not an exotic input: any
+    window where nobody converted produces it, as does a freshly launched funnel.
+    """
+    import pandas as pd
+
+    from bl_ranking.data.delta import read_snapshot
+    from bl_ranking.data.ingest import ingest
+
+    survey = ["credit_score", "industry", "loan_amount", "loan_reason",
+              "monthly_revenue", "time_in_business", "device_type", "business_type"]
+    rows = 6
+    extract = pd.DataFrame({
+        "session_id": [f"s{i}" for i in range(rows)],
+        "cellphone": ["7869914030"] * rows,
+        "campaign_id": ["120227360861540306"] * rows,
+        "payout": [0.0] * rows,
+        "session_dt": ["2026-01-06 19:24:22"] * rows,
+        "conversion_dt": [None] * rows,          # nobody converted
+        "register_date": ["2026-01-06 19:26:07"] * rows,
+        "client_name": ["sba central"] * rows,
+        "disposition": ["Rejected"] * rows,
+        "disposition_source": ["x"] * rows,
+        "page": ["p"] * rows,
+        "auto_city": ["Miami"] * rows, "auto_state": ["Florida"] * rows,
+        "auto_country": ["United States"] * rows,
+        "sub1": ["1"] * rows, "sub2": ["2"] * rows, "sub3": ["3"] * rows,
+        "fname": ["Michael"] * rows, "lname": ["Smith"] * rows,
+        **{c: ["x"] * rows for c in survey},
+    })
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    extract.to_csv(raw / "bl_full_data.csv", index=False)
+
+    local = Settings.load()
+    local.paths.raw_dir = str(raw)
+    local.paths.delta_table = str(tmp_path / "delta")
+
+    report = ingest(local)
+    assert report.rows_out == rows
+    assert len(read_snapshot(local.paths.delta_table).frame) == rows
+
+@pytest.mark.parametrize("quartz,day_of_week", [
+    ("0 0 5 ? * SUN *", "sun"),
+    ("0 0 5 ? * 1 *", "sun"),      # Quartz 1 is Sunday; APScheduler 1 is Tuesday
+    ("0 0 5 ? * 2 *", "mon"),
+    ("0 0 5 ? * 7 *", "sat"),
+    ("0 0 5 ? * 2-6 *", "mon-fri"),
+    ("0 0 5 ? * MON,WED *", "mon,wed"),
+    ("0 0 5 ? * * *", "*"),
+])
+def test_quartz_day_numbers_are_translated_not_passed_through(quartz, day_of_week):
+    """Quartz numbers days 1=SUN..7=SAT; APScheduler numbers 0=MON..6=SUN.
+
+    A number passed through unchanged moves the schedule two days with no error, so a
+    weekly retrain written as '1' for Sunday would have run on Tuesday. Both systems
+    read the same three-letter names, so numbers become names.
+    """
+    from bl_ranking.ops.schedule import parse_quartz
+
+    assert parse_quartz(quartz).day_of_week == day_of_week
+
+
+def test_an_impossible_quartz_day_is_rejected():
+    from bl_ranking.ops.schedule import parse_quartz
+
+    with pytest.raises(ValueError, match="outside 1-7"):
+        parse_quartz("0 0 5 ? * 9 *")
+

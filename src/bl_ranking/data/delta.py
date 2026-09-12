@@ -47,8 +47,30 @@ def write_snapshot(frame: pd.DataFrame, table_uri: str | Path,
     """
     path = resolve(table_uri)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_deltalake(str(path), frame, mode=mode, schema_mode="overwrite")
+    write_deltalake(str(path), _typed_for_delta(frame), mode=mode, schema_mode="overwrite")
     return DeltaTable(str(path)).version()
+
+
+def _typed_for_delta(frame: pd.DataFrame) -> pd.DataFrame:
+    """Give entirely-null columns a concrete type before the write.
+
+    Arrow infers the `Null` type for a column with nothing in it, and Delta rejects
+    that outright: "Invalid data type for Delta Lake: Null". It is not an exotic case -
+    conversion_dt is empty in any window where nobody converted, which is an ordinary
+    quiet period or a freshly launched funnel, and the whole ingestion then fails with
+    a message that names neither the column nor the file.
+
+    Typed as string because every column that can be wholly null here is either a
+    timestamp already normalised to an ISO string or a categorical, and the research
+    code reads the staged CSV back with its own inference regardless.
+    """
+    empty = [c for c in frame.columns if frame[c].isna().all()]
+    if not empty:
+        return frame
+    typed = frame.copy()
+    for column in empty:
+        typed[column] = typed[column].astype("string")
+    return typed
 
 
 def read_snapshot(table_uri: str | Path, version: int | None = None,
