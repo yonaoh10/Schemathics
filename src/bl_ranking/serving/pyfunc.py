@@ -28,7 +28,8 @@ from typing import Any
 
 import mlflow
 import pandas as pd
-from mlflow.models import ModelSignature, infer_signature
+from mlflow.models import ModelSignature
+from mlflow.types import ColSpec, DataType, Schema
 from pydantic import ValidationError
 
 from bl_ranking.config import Settings
@@ -131,17 +132,55 @@ def _as_frame(model_input: Any) -> pd.DataFrame:
     return pd.DataFrame(model_input)
 
 
+# What RankRequest insists on. Everything else is optional there, and has to be optional
+# here too, or the portable form refuses payloads the HTTP endpoint accepts.
+REQUIRED_REQUEST_FIELDS: tuple[str, ...] = (
+    "session_dt", "register_date", "campaign_id", "page",
+)
+
+
 def request_example() -> pd.DataFrame:
-    """One-row input example, stored with the model so the schema is self-documenting."""
-    return pd.DataFrame([{k: WARMUP_USER[k] for k in REQUEST_FIELDS}])
+    """One-row input example, stored with the model so the schema is self-documenting.
+
+    Ids are rendered as text to match the declared schema - see build_signature.
+    """
+    return pd.DataFrame([{k: _as_text(WARMUP_USER[k]) for k in REQUEST_FIELDS}])
+
+
+def _as_text(value: Any) -> Any:
+    return value if value is None or isinstance(value, str) else str(value)
 
 
 def build_signature() -> ModelSignature:
-    example = request_example()
-    output = pd.DataFrame({
-        "ranking": ['{"brand": {"rank": 1.0, "expected_payout": 42.31}}'],
-        "error": [None],
-        "payout_backend": ["surrogate"],
-        "payout_exact": [False],
-    })
-    return infer_signature(example, output)
+    """Declare the input schema rather than inferring it from one example row.
+
+    `infer_signature` read the example and declared campaign_id, sub1, sub3 and
+    cellphone as `long`, and every one of the 22 fields as required. Both are narrower
+    than the contract the HTTP endpoint honours, and each broke a whole batch:
+
+      * one null `cellphone` - an optional field - demotes its column to float64, which
+        enforcement then refuses as an unsafe cast to int64. A single missing phone
+        number failed all 500 rows, which is exactly the coupling per-row validation
+        exists to remove.
+      * a 17-digit `campaign_id` cannot cross a columnar boundary as a number at all.
+        One null in the column makes it float64 and 120227360861540306 becomes
+        ...304 - the same float64 demotion the ingestion gate reads these columns as
+        text to avoid (data/ingest.READ_AS_TEXT), on the other side of the system.
+
+    So: text for every field, and required only for the four RankRequest requires. The
+    per-row validator converts each value on its own, which is what makes a row's
+    features independent of the rest of its batch. The cost is explicit - a caller that
+    sends an id as a JSON number gets an MLflow type error naming the column, instead of
+    a silently rounded id - and the HTTP endpoint still accepts either spelling.
+    """
+    inputs = Schema([
+        ColSpec(DataType.string, name, required=name in REQUIRED_REQUEST_FIELDS)
+        for name in REQUEST_FIELDS
+    ])
+    outputs = Schema([
+        ColSpec(DataType.string, "ranking"),
+        ColSpec(DataType.string, "error", required=False),
+        ColSpec(DataType.string, "payout_backend"),
+        ColSpec(DataType.boolean, "payout_exact"),
+    ])
+    return ModelSignature(inputs=inputs, outputs=outputs)

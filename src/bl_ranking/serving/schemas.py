@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _NON_DIGITS = re.compile(r"\D")
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
@@ -77,8 +77,40 @@ class RankRequest(BaseModel):
     # validate_default: a `before` validator does not run when the key is absent,
     # so without this an omitted cellphone stayed None and took down the request
     # inside the research pipeline's `.astype(int)` - a 500 for a field the
-    # schema calls optional.
-    cellphone: Annotated[int | str | None, Field(validate_default=True)] = None
+    # schema calls optional. Set by assignment rather than inside Annotated, which
+    # pydantic 2.13 warns is an unsupported position for this particular attribute.
+    cellphone: int | str | None = Field(default=None, validate_default=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unencodable_text(cls, data: Any) -> Any:
+        """Refuse a string Python holds but UTF-8 cannot encode.
+
+        `json.loads` accepts the escape `\ud800` and produces a str containing a lone
+        UTF-16 surrogate. Nothing downstream can encode it: CatBoost's C++ layer takes
+        the whole request down with `SystemError: <class 'UnicodeEncodeError'> returned
+        a result with an exception set` - not an exception any handler recognises - and
+        FastAPI's own 422 renderer fails the same way while trying to report it, which
+        is how a bad string became a 500 on both the valid and the invalid path.
+
+        Checked here, as a model-level `before` validator, so it runs ahead of every
+        field validator and covers all 22 fields including the ones only passed through.
+        The offending text is named by field and never echoed: repeating it in the error
+        body would hit the same encoder that just failed.
+        """
+        if not isinstance(data, dict):
+            return data
+        for key, value in data.items():
+            if not isinstance(value, str):
+                continue
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    f"{key} contains text that is not valid UTF-8 "
+                    f"(a lone surrogate at position {exc.start})"
+                ) from exc
+        return data
 
     @field_validator("session_dt", "register_date", mode="before")
     @classmethod
@@ -147,25 +179,16 @@ class RankRequest(BaseModel):
         rule the training data got, so a junk id degrades to the 0 level on both sides
         instead of failing the request.
         """
-        if value is None:
-            return 0
-        text = str(value).strip()
-        try:
-            number = int(text)
-        except ValueError:
-            try:
-                # '1.2e17' and '120227360861540306.0' both appear in real extracts.
-                number = int(float(text))
-            except (ValueError, OverflowError):
-                return 0
-        # The same bound data/ingest._as_int64 applies, and for the same reason: the
-        # training column is int64, so a larger value is the 0 level there. Without it
-        # the Python int travelled into the feature matrix, where CatBoost raised on
-        # anything past float range - a 500 carrying a library message - and silently
-        # scored everything below it differently from how training saw it.
-        if not (_INT64_MIN <= number <= _INT64_MAX):
-            return 0
-        return number
+        # The gate's own parser, imported rather than restated. It reads
+        # '120227360861540306.0' exactly - stripping the suffix textually, because the
+        # obvious `int(float(text))` rounds it to ...304, which is the precise float64
+        # demotion the gate exists to undo, reintroduced at the request boundary. It
+        # also applies the int64 bound the training column has, and returns None for a
+        # non-finite or unparseable value, which becomes the 0 level here exactly as it
+        # does in training. Two copies of this rule would be two chances to drift.
+        from bl_ranking.data.ingest import _as_int64
+        parsed = _as_int64(value)
+        return 0 if parsed is None else parsed
 
     @field_validator("cellphone", mode="before")
     @classmethod
@@ -178,6 +201,18 @@ class RankRequest(BaseModel):
         """
         if value is None:
             return 0
+        # A JSON caller has no integers: {"cellphone": 13055550142} and
+        # {"cellphone": 13055550142.0} are the same payload to a browser. str() renders
+        # the second as '13055550142.0', whose digits are '130555501420' - twelve, so
+        # the country-code strip below does not fire and the prefix feature becomes
+        # '130' where the same number as an int gives '305'. Same user, same phone,
+        # different ranking. Rendering a whole-number float as its integer closes that.
+        #
+        # Only a whole number is rewritten. A fractional value is left to the digit
+        # strip, which is what the ingestion gate does with the same text in a CSV cell,
+        # so the two sides still agree on input that is junk to begin with.
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
         digits = _NON_DIGITS.sub("", str(value))
         if len(digits) == 11 and digits.startswith("1"):
             digits = digits[1:]

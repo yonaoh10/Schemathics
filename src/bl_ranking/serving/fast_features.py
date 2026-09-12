@@ -174,9 +174,17 @@ def _user_row(user: dict[str, Any], gender_lookup=None) -> dict[str, Any]:
         session_day = session_dt.day
         session_day_of_week = _DAY_NAMES[session_dt.weekday()]
         session_hour = session_dt.hour
+    # `.value / 1e9`, not `.total_seconds()`. The research code computes this with
+    # pandas' `.dt.total_seconds()`, which divides an int64 nanosecond count by 1e9 in
+    # float64; datetime.timedelta.total_seconds() computes it exactly. Past about 104
+    # days the nanosecond count passes float64's 53-bit mantissa and the two answers
+    # separate - 7258118399.000001 against 7258118399.0 on a span the schema accepts.
+    # The research path is the reference, so this mirrors its arithmetic rather than
+    # improving on it: a feature the two paths compute differently is a broken
+    # equivalence contract whichever value is nearer the truth.
     from_start_to_register = (
         np.nan if (pd.isna(session_dt) or pd.isna(register_date))
-        else (register_date - session_dt).total_seconds()
+        else pd.Timedelta(register_date - session_dt).value / 1e9
     )
 
     # -- additional_features, lines 187-192 ----------------------------------------

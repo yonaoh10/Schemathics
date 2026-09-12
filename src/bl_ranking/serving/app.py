@@ -26,6 +26,7 @@ Design choices that matter for tail latency
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -33,7 +34,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
@@ -113,6 +115,41 @@ app = FastAPI(
     default_response_class=ORJSONResponse,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(_request, exc: RequestValidationError) -> Response:
+    """Render a rejected payload ourselves, because the default renderer can crash.
+
+    FastAPI's built-in handler echoes each error's `input` value back. Two kinds of
+    input make that fail, and both turned a 422 into a 500 - the wrong status, no log
+    line the caller can act on, and nothing counted, so a funnel sending malformed
+    traffic was invisible on the dashboard:
+
+      * a non-finite float (`NaN`, `Infinity`, which json.loads accepts) - not
+        representable in JSON, so the encoder raises;
+      * a lone UTF-16 surrogate from a `\ud800` escape - not encodable as UTF-8, so
+        the encoder raises while reporting the string that caused it.
+
+    So only `loc`, `msg` and `type` are returned, serialised with ensure_ascii, which
+    escapes a surrogate back into the form it arrived in. The caller's own value is
+    never echoed - it cannot be rendered, and repeating unvalidated input in an error
+    body is not something to do on a public endpoint anyway.
+    """
+    REQUESTS.labels("invalid_request").inc()
+    detail = [
+        {
+            "loc": [str(part) for part in error.get("loc", ())],
+            "msg": str(error.get("msg", "")),
+            "type": str(error.get("type", "")),
+        }
+        for error in exc.errors()
+    ]
+    return Response(
+        content=json.dumps({"detail": detail}, ensure_ascii=True),
+        status_code=422,
+        media_type="application/json",
+    )
 
 
 @app.post("/rank", response_model=None, responses={200: {"model": RankResponse}})
