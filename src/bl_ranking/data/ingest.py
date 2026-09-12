@@ -19,6 +19,7 @@ import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from bl_ranking.config import Settings, resolve
@@ -121,7 +122,11 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     raw_phone = frame["cellphone"]
     digits = raw_phone.astype(str).str.replace(r"\D", "", regex=True)
     # Strip a leading US country code so '+1 786...' and '786...' give the same prefix.
-    digits = digits.mask(digits.str.len() == 11, digits.str[1:])
+    # The "1" matters: without it this stripped the first digit of *any* 11-digit
+    # number while serving/schemas.py only strips a leading 1, so the same phone
+    # produced a different cellphone_prefix in training than at request time.
+    is_us_country_code = (digits.str.len() == 11) & digits.str.startswith("1")
+    digits = digits.mask(is_us_country_code, digits.str[1:])
     parsed_phone = _exact_int64_column(digits)
     # Counts unparseable AND out-of-int64 numbers. The previous to_numeric route let a
     # 20-digit value wrap to INT64_MIN while reporting zero repairs.
@@ -140,6 +145,13 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     # 3. payout must be numeric for fillna(0) and the payout > 0 mask.
     payout = pd.to_numeric(frame["payout"], errors="coerce")
     repairs["payout"] = int((payout.isna() & frame["payout"].notna()).sum())
+    # inf and -inf survive to_numeric, then reach the payout model and the `payout > 0`
+    # mask the research code builds its TabPFN context from. A single one poisons the
+    # regressor's target range while every repair counter reports zero.
+    not_finite = payout.notna() & ~np.isfinite(payout)
+    repairs["payout_not_finite"] = int(not_finite.sum())
+    payout = payout.mask(not_finite)
+    repairs["payout"] = int(repairs["payout"]) + int(not_finite.sum())
     frame["payout"] = payout
 
     # 4. Attribution ids must stringify identically in training and in serving.
@@ -175,7 +187,7 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     # Timestamps are normalised to ISO strings so the Delta round trip reproduces
     # exactly what pd.read_csv would have handed the research code.
     for col in ("session_dt", "conversion_dt", "register_date"):
-        parsed = pd.to_datetime(frame[col], errors="coerce")
+        parsed = _to_utc_naive(frame[col])
         frame[col] = parsed.dt.strftime("%Y-%m-%d %H:%M:%S").where(parsed.notna(), None)
 
     # A row with no session timestamp cannot be placed on the train/test timeline.
@@ -189,6 +201,30 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
 
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 
+
+
+def _to_utc_naive(values: pd.Series) -> pd.Series:
+    """Parse timestamps to naive UTC, whatever mixture of offsets the column holds.
+
+    Two passes, because neither alone is correct. Without `utc=True`, a column mixing
+    '...+00:00' with '...-05:00' - which is what a DST transition looks like in an
+    export - comes back as an object column of datetimes and the `.dt` accessor raises
+    on it. With `utc=True`, pandas refuses to mix aware and naive values in one call
+    and quietly turns every naive one into NaT, which the row filter below then drops:
+    a crash traded for silent data loss.
+
+    So: parse everything as UTC, then re-parse only what that turned into NaT as naive
+    and label it UTC. The warehouse assumption is stated in serving/schemas.py and is
+    the same on both sides - a timestamp with no offset is UTC.
+    """
+    aware = pd.to_datetime(values, errors="coerce", utc=True)
+    missed = aware.isna() & values.notna()
+    if missed.any():
+        retry = pd.to_datetime(values[missed], errors="coerce")
+        if getattr(retry.dtype, "tz", None) is None:
+            retry = retry.dt.tz_localize("UTC")
+        aware = aware.where(~missed, retry)
+    return aware.dt.tz_convert("UTC").dt.tz_localize(None)
 
 def _as_int64(value: object) -> int | None:
     """Parse an id to an exact int64, or None if it cannot be one.

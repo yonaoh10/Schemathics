@@ -676,3 +676,109 @@ def test_every_registry_backend_counts_as_authoritative(settings, monkeypatch, u
     monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
     assert _registry_is_authoritative(settings) is authoritative
 
+def _gate_frame(rows=3, **override):
+    """A minimal well-formed extract, for tests that damage one column of it."""
+    import pandas as pd
+
+    survey = ["credit_score", "industry", "loan_amount", "loan_reason",
+              "monthly_revenue", "time_in_business", "device_type", "business_type"]
+    frame = pd.DataFrame({
+        "cellphone": ["7869914030"] * rows,
+        "campaign_id": ["1"] * rows,
+        "payout": [0.0] * rows,
+        "session_dt": ["2026-01-06 19:24:22"] * rows,
+        "conversion_dt": [None] * rows,
+        "register_date": [None] * rows,
+        **{c: ["x"] * rows for c in survey},
+    })
+    for column, values in override.items():
+        frame[column] = values
+    return frame
+
+
+def test_the_phone_rule_is_the_same_on_both_sides():
+    """cellphone_prefix is a model feature, so the two sides must derive it identically.
+
+    Ingestion stripped the first digit of ANY 11-digit number while serving only strips
+    a leading US country code, so an 11-digit number starting with anything else got a
+    different prefix in training than at request time.
+    """
+    from bl_ranking.data.ingest import sanitise
+    from bl_ranking.serving.schemas import RankRequest
+
+    numbers = ["27869914030", "17869914030", "7869914030"]
+    ingested, _ = sanitise(_gate_frame(cellphone=numbers))
+    served = [RankRequest.normalise_cellphone(n) for n in numbers]
+    assert ingested["cellphone"].tolist() == served
+
+
+def test_a_non_finite_payout_is_removed_and_counted():
+    """inf survives to_numeric, then reaches the payout model and the `payout > 0` mask."""
+    import numpy as np
+
+    from bl_ranking.data.ingest import sanitise
+
+    cleaned, repairs = sanitise(_gate_frame(payout=[float("inf"), float("-inf"), 12.5]))
+    assert repairs["payout_not_finite"] == 2
+    finite = cleaned["payout"].dropna()
+    assert np.isfinite(finite).all()
+    assert 12.5 in finite.tolist()
+
+
+def test_mixed_timezone_offsets_neither_crash_nor_drop_rows():
+    """A DST transition makes one export column carry two different offsets.
+
+    Parsing without utc=True raises on the .dt accessor; parsing with it turns every
+    naive value into NaT, which the row filter then drops. Both happened here in turn.
+    """
+    from bl_ranking.data.ingest import sanitise
+
+    cleaned, repairs = sanitise(_gate_frame(session_dt=[
+        "2026-01-06 19:24:22+00:00",   # UTC
+        "2026-01-06 19:24:22-05:00",   # same wall clock, five hours later in UTC
+        "2026-01-06 19:24:22",         # naive, assumed UTC on both sides
+    ]))
+
+    assert len(cleaned) == 3, "a valid row was dropped"
+    assert repairs.get("dropped_no_session_dt", 0) == 0
+    assert cleaned["session_dt"].tolist() == [
+        "2026-01-06 19:24:22", "2026-01-07 00:24:22", "2026-01-06 19:24:22"]
+
+def test_re_promoting_the_serving_version_does_not_destroy_the_way_back(settings, bundle):
+    """champion_previous must never point at the version that is currently serving.
+
+    MLflow returns `.version` as a string while a caller may hold an int, and
+    "3" != 3 is always true - so the guard never fired. Re-running the documented
+    rollback pointed champion_previous at the version being rolled back *to*,
+    overwriting the only pointer back to the one it replaced.
+
+    With a single registered version the correct outcome is that the alias is not
+    written at all: nothing was replaced, so there is nothing to point back to.
+    """
+    import mlflow
+    from mlflow.tracking import MlflowClient
+
+    from bl_ranking.ops.registry import set_alias
+
+    mlflow.set_tracking_uri(settings.mlflow.resolved_tracking_uri())
+    client = MlflowClient()
+    name = settings.mlflow.registered_model
+    alias = settings.mlflow.serving_alias
+    serving = client.get_model_version_by_alias(name, alias).version
+
+    # A careless operator repeating the command, once as a string and once as an int:
+    # argparse hands over a string, MLflow's file store reports an int, and the two
+    # never compared equal.
+    set_alias(settings, str(serving))
+    set_alias(settings, int(serving))
+
+    # Compared as strings: the file store returns an int here while a SQL-backed store
+    # returns a string, which is the type mismatch the fix is about in the first place.
+    assert str(client.get_model_version_by_alias(name, alias).version) == str(serving)
+    try:
+        previous = client.get_model_version_by_alias(name, f"{alias}_previous").version
+    except Exception:
+        return          # never written, which is right: nothing was replaced
+    assert str(previous) != str(serving), (
+        "champion_previous points at the serving version, so there is no way back"
+    )
