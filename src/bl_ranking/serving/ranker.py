@@ -246,10 +246,26 @@ class BrandRanker:
             "trained_at": self.warm.manifest.trained_at,
             "delta_version": self.warm.manifest.delta_version,
             "n_brands": self.warm.n_brands,
-            "gender_lookup": "precomputed" if self.warm.gender else "names_dataset",
+            "gender_lookup": _gender_source(self.warm.gender),
         }
         info.update(self.warm.payout.describe())
         return info
+
+
+def _gender_source(gender: GenderLookup | None) -> str:
+    """What GET /model says about the gender feature.
+
+    Three states, not two. A table built before the lookup-key fix answers 'unknown'
+    for roughly a fifth of first names while the research path answers correctly, and
+    it is indistinguishable from a good one by row count or file size - so the one
+    place that can tell says so, where an operator comparing a rollback against a
+    champion will see it.
+    """
+    if gender is None:
+        return "names_dataset"
+    if len(gender) == 0:
+        return "names_dataset"
+    return "precomputed" if gender.key_scheme_current else "precomputed_stale_key"
 
 
 # A representative post-funnel payload, used for warm-up and by the smoke tests.
@@ -331,13 +347,20 @@ def _assert_usable_brand_universe(all_clients: pd.DataFrame, directory: Path) ->
         )
 
     usable = names.astype(str).str.strip()
-    if usable.empty:
+    # The sentinel is not a lender, and every other part of serving already knows that:
+    # WarmModels.n_brands and BrandRanker._brands both drop it. Counting it here was
+    # what let a clients file of nothing but 'other' pass the guard, report n_brands 0,
+    # and answer every request 200 with an empty ranking while /readyz stayed green -
+    # the exact outage this function exists to refuse.
+    rankable = usable[usable != bundle_files.OTHER_BRAND]
+    if rankable.empty:
         raise ValueError(
             f"Model bundle at {directory} has an empty brand universe "
-            f"({bundle_files.CLIENTS_FILE}); there is nothing to rank."
+            f"({bundle_files.CLIENTS_FILE}); there is nothing to rank. "
+            f"{len(usable)} row(s) present, none of them a brand."
         )
 
-    duplicated = usable[usable.duplicated()].unique()
+    duplicated = rankable[rankable.duplicated()].unique()
     if len(duplicated):
         raise ValueError(
             f"Model bundle at {directory}: {bundle_files.CLIENTS_FILE} lists "

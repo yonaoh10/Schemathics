@@ -225,7 +225,15 @@ def _read_yaml(path: Path) -> dict[str, Any]:
             f"config path {path} is a directory, not a file. BL_CONFIG must name "
             f"conf/config.yaml itself."
         )
-    loaded = yaml.safe_load(path.read_text())
+    try:
+        loaded = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        # PyYAML's own message is a parser trace with a line and column and no mention
+        # of which file it was reading - and the file it was reading is whatever
+        # BL_CONFIG points at, which is exactly what the operator needs told back.
+        raise ValueError(f"config file {path} is not valid YAML: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"config file {path} is not UTF-8 text: {exc}") from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
@@ -342,6 +350,45 @@ def _build(cls: type, raw: dict[str, Any], path: str = "") -> Any:
     return instance
 
 
+def _checked_shape(value: Any, default: Any, where: str, annotation: Any = None) -> Any:
+    """Check an already-typed value against the type its field declares.
+
+    The field's default is what says which type that is - the annotations are source
+    strings under `from __future__ import annotations`. `bool` is tested before `int`
+    because it is a subclass of one, so `workers: true` must not read as 1.
+
+    A nullable setting (default None) accepts None and any scalar; the declared
+    annotation is not precise enough here to say more, and a wrong scalar on one of
+    those is caught by Settings.validate() with the setting named.
+    """
+    if default is None:
+        if isinstance(value, list | tuple | dict | set):
+            raise ValueError(
+                f"{where}: expected a single value, got {type(value).__name__} {value!r}"
+            )
+        return value
+    if value is None:
+        raise ValueError(
+            f"{where}: expected {type(default).__name__}, got null. This setting has no "
+            f"null form; remove the line to keep the default ({default!r})."
+        )
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        raise ValueError(f"{where}: expected a boolean, got {value!r}")
+    if isinstance(default, int):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{where}: expected an integer, got {value!r}")
+        return value
+    if isinstance(default, float):
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"{where}: expected a number, got {value!r}")
+        return float(value)
+    if isinstance(default, str) and not isinstance(value, str):
+        raise ValueError(f"{where}: expected text, got {type(value).__name__} {value!r}")
+    return value
+
+
 def _as_field_type(value: Any, default: Any, where: str, annotation: Any = None) -> Any:
     """Convert an override to the type its field declares, or say why it cannot be.
 
@@ -349,8 +396,18 @@ def _as_field_type(value: Any, default: Any, where: str, annotation: Any = None)
     the parser - pass through untouched. A bad value raises here, naming the setting,
     rather than travelling into the service as the wrong type and failing somewhere
     that gives no clue which variable caused it.
+
+    "Typed by the parser" is not the same as "the right type", which is why an
+    already-typed value is still shape-checked. `context_size: null` and
+    `context_size: [1, 2]` in conf/config.yaml both used to travel into
+    Settings.validate() and surface as `'<' not supported between instances of
+    'NoneType' and 'int'` - a message that names neither the setting, the file, nor the
+    value. `threads_per_worker: 1.5` was worse: nothing objected at all and the float
+    reached torch.
     """
-    if not isinstance(value, str) or isinstance(default, str):
+    if not isinstance(value, str):
+        return _checked_shape(value, default, where, annotation)
+    if isinstance(default, str):
         return value
     text = value.strip()
     if isinstance(default, bool):

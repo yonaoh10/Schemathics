@@ -37,6 +37,10 @@ GENDER_LOOKUP_FILE = "gender_lookup.parquet"   # models/gender_lut.ARTIFACT_NAME
 
 # The single column all_clients.csv carries, and the name the research code joins on.
 CLIENT_NAME_COLUMN = "client_name"
+# The research code fills a missing client_name with this sentinel and then drops those
+# rows (bl_models_train.py line 83, bl_exp_payout_predictor.py line 70). It is a marker
+# for "no brand", never a lender, so nothing in serving may rank it or count it.
+OTHER_BRAND = "other"
 
 
 log = logging.getLogger("bl_ranking.models")
@@ -80,7 +84,19 @@ class Manifest:
         path = Path(directory) / MANIFEST_FILE
         if not path.exists():
             return cls()
-        raw = json.loads(path.read_text())
+        # Tolerating a newer manifest is not the same as tolerating a broken one. A
+        # truncated or half-written file, or one that is valid JSON but not an object,
+        # took the worker down with "'list' object has no attribute 'items'" or
+        # "'NoneType' object is not iterable" - naming neither the bundle nor the file.
+        try:
+            raw = json.loads(path.read_text())
+        except ValueError as exc:
+            raise ValueError(f"{path} is not readable as JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"{path} must contain a JSON object of manifest fields, got "
+                f"{type(raw).__name__}."
+            )
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(raw) - known)
         if unknown:

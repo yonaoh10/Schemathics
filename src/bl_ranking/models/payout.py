@@ -581,7 +581,12 @@ class SurrogateBackend(PayoutBackend):
         # is every value someone would choose for that purpose. The floor that does
         # matter is one row per brand, and it is applied below.
         target_rows = self.cfg.surrogate_sample_rows
-        per_brand = max(1, target_rows // len(brands))
+        # Two users per brand, not one. `fit` holds out max(1, 20% of users) whole users
+        # to measure fidelity, so a single user leaves nothing to fit on and CatBoost
+        # raises on an empty label vector - twenty minutes into the weekly run, for a
+        # setting that passed validate(). Two is the smallest sample that still has a
+        # fit row and a holdout row.
+        per_brand = max(2, target_rows // len(brands))
         base = x.sample(n=min(per_brand, len(x)), random_state=42,
                         replace=per_brand > len(x))
 

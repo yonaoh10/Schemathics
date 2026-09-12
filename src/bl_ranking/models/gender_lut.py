@@ -53,8 +53,13 @@ UNKNOWN: tuple[str, float] = ("unknown", 0.0)
 class GenderLookup:
     """In-memory name -> (gender, confidence) map with the research code's semantics."""
 
-    def __init__(self, table: dict[str, tuple[str, float]]) -> None:
+    def __init__(self, table: dict[str, tuple[str, float]],
+                 key_scheme_current: bool = True) -> None:
         self._table = table
+        # False only for a table loaded from a file built before the key fix. Reported
+        # by GET /model, so a degraded feature is visible from outside the worker and
+        # not only in its start-up log.
+        self.key_scheme_current = key_scheme_current
 
     def __len__(self) -> int:
         return len(self._table)
@@ -83,12 +88,41 @@ class GenderLookup:
 
     @classmethod
     def load(cls, path: str | Path) -> GenderLookup:
+        """Read the table and check it is one, before a worker starts serving from it.
+
+        A table nothing validates is a silent feature outage waiting to happen: an
+        empty or truncated parquet answers 'unknown' for every name, the four bundle
+        guards say nothing (they check the two models and the brand list), /readyz goes
+        green, and the ranking simply changes. Every check here is on the file's own
+        shape, so it costs a fraction of the read it follows.
+        """
         table = pq.read_table(path)
-        _warn_if_stale(table, path)
+        missing = [c for c in ("name", "gender", "confidence")
+                   if c not in table.column_names]
+        if missing:
+            raise ValueError(
+                f"{path} is not a gender lookup table: missing column(s) "
+                f"{', '.join(missing)}; columns present are {table.column_names}."
+            )
+        if table.num_rows == 0:
+            raise ValueError(
+                f"{path} is an empty gender lookup table. Every first name would "
+                f"resolve to 'unknown' while the research path resolves them, so the "
+                f"two feature implementations would disagree on every request."
+            )
+        if table.column("name").null_count:
+            raise ValueError(
+                f"{path} has {table.column('name').null_count} null name key(s); the "
+                f"lookup would never match them."
+            )
+        current = _warn_if_stale(table, path)
         names = table.column("name").to_pylist()
         genders = table.column("gender").to_pylist()
         confidences = table.column("confidence").to_pylist()
-        return cls(dict(zip(names, zip(genders, confidences, strict=False), strict=False)))
+        return cls(
+            dict(zip(names, zip(genders, confidences, strict=False), strict=False)),
+            key_scheme_current=current,
+        )
 
     @classmethod
     def build(cls, path: str | Path | None = None, dataset=None) -> GenderLookup:
@@ -196,7 +230,7 @@ class _LiveGenderLookup(GenderLookup):
     """GenderLookup backed by a names-dataset instance rather than a materialised table."""
 
     def __init__(self, dataset) -> None:  # noqa: D107 - see GenderLookup.live
-        super().__init__({})
+        super().__init__({}, key_scheme_current=True)
         self._dataset = dataset
 
     def __len__(self) -> int:
@@ -206,7 +240,7 @@ class _LiveGenderLookup(GenderLookup):
         return _detect(self._dataset, fname)
 
 
-def _warn_if_stale(table, path) -> None:
+def _warn_if_stale(table, path) -> bool:
     """Say so when a table was built before the lookup key was fixed.
 
     A table keyed on the dataset's own spelling is indistinguishable from a correct one
@@ -220,10 +254,11 @@ def _warn_if_stale(table, path) -> None:
     """
     metadata = table.schema.metadata or {}
     if metadata.get(KEY_SCHEME_FIELD) == KEY_SCHEME:
-        return
+        return True
     log.warning(
         "%s predates the lookup-key fix (no %s marker). Roughly a fifth of first names "
         "will resolve to 'unknown' on the vectorised path while the research path "
         "resolves them correctly. Retrain to rebuild the table.",
         path, KEY_SCHEME_FIELD.decode(),
     )
+    return False
