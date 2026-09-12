@@ -261,8 +261,10 @@ images.
 **Sizing.** The training job peaks around 9.5 GB resident on the full two-month window:
 2.4 GB of it is the names-dataset import, the rest is the 81k-row frame and the
 teacher-labelled distillation sample. That is what the cluster node type in
-`databricks.yml` is sized for. Serving is a different shape entirely — roughly 400 MB
-per worker, because the gender table replaced the library.
+`databricks.yml` is sized for. Serving is a different shape entirely: 866 MB resident per
+worker measured warm, 688 MB of it private, so the documented three workers cost 2.1 GB
+together. The gender table replaced the names library, which is what keeps a worker under a
+gigabyte at all — the library alone was 2.4 GB.
 
 **Weekly, Sunday 05:00.** A Databricks job with three tasks: ingest the extract into a
 Delta table, fit and register a version, then run the evaluation mode for the researcher
@@ -313,10 +315,29 @@ load. The Databricks endpoint is configured `scale_to_zero_enabled: false` for t
 reason: a cold start on a landing page is a lost session.
 
 **What is monitored.** Request rate, latency histogram and error rate by outcome via
-Prometheus; per-run ingest repair counters and the share of rows landing on the `-99`
-sentinel for each band mapping. That last one matters more than it looks: a copy change
-that renames a funnel answer sends every user to `-99` silently, and it would show up as
-a metric before it showed up as revenue.
+Prometheus; the ingest repair counters, carried in the Delta commit and logged as params by
+the run that reads that version; and `bl_rank_band_sentinel_total{feature=...}`, the number
+of requests whose survey answer matched no band. That last one matters more than it looks: a
+copy change that renames a funnel answer sends every user to `-99` silently - the feature
+still has a value, the request still returns 200 - so it would otherwise show up as revenue
+rather than as an error.
+
+It is worth saying that this paragraph described the sentinel metric for some time before
+the metric existed. It does now, on both feature paths, computed from the same `band_values`
+the features come from so it cannot disagree with what the model was given.
+
+**One scrape, every worker.** Each metric is a module-level object, so it lives in the
+worker that imported it — and the service runs three. A scrape therefore used to report
+whichever worker the kernel happened to hand the connection to: 60 requests sent, one
+scrape saying 48 and the next saying 7. `PROMETHEUS_MULTIPROC_DIR` (set by
+`scripts/serve.sh`, and by the compose file to a path outside the bind mount, since the
+files are named by pid) moves the counters into shared mmap'd files that `/metrics` merges,
+and the same 60 requests now read as 60. Counters and histograms sum; the two gauges say
+how they aggregate — `bl_rank_brands` takes the max, `bl_rank_ready` the min, so one worker
+that failed to load cannot be hidden by two that did. `/metrics` deletes the gauge files of
+workers that have exited, which is what makes "the workers that are alive" true: nothing
+else can, because uvicorn's supervisor offers the application no worker-exit hook. Their
+counters are kept on purpose — a request a replaced worker served still happened.
 
 ---
 

@@ -17,7 +17,7 @@ Nothing here changes a feature value for a well-formed request.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -25,6 +25,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 _NON_DIGITS = re.compile(r"\D")
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
+
+# How much of a rejected value an error message may quote.
+_SHOWN_CHARS = 80
+
+
+def _shown(value: Any) -> str:
+    """A value, rendered short enough to put in an error message.
+
+    Naming the value that was refused is most of what makes a 422 actionable, but the
+    value belongs to the caller and its size does not: a 32 MB string in `session_dt`
+    became a 32 MB error message and a 33 MB response body, built on the event loop, so
+    one request made the worker unavailable for two seconds and cost the sender nothing.
+    The size cap on the request body bounds this too now; this keeps the message readable
+    and the bound in the one place a reader of the message will look.
+    """
+    text = repr(value)
+    if len(text) <= _SHOWN_CHARS:
+        return text
+    return f"{text[:_SHOWN_CHARS]}... ({len(text)} characters)"
 
 # The shape the research pipeline's pd.to_datetime reads without ambiguity.
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -42,6 +61,10 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 # The epoch is the floor because these are web-session timestamps: a session before
 # 1970 is a malformed field, not a very old lead. The ceiling keeps the whole window
 # inside one timedelta span.
+# How much of an inverted (register_date, session_dt) pair to forgive. Clock skew between
+# two services is ordinary at this scale and is not what the check is for.
+_CLOCK_SKEW_TOLERANCE = timedelta(seconds=60)
+
 _TIMESTAMP_MIN = datetime(1970, 1, 1)
 _TIMESTAMP_MAX = datetime(2200, 1, 1)
 
@@ -80,12 +103,40 @@ class RankRequest(BaseModel):
     time_in_business: str | None = None
     fname: str | None = None
     lname: str | None = None
-    # validate_default: a `before` validator does not run when the key is absent,
-    # so without this an omitted cellphone stayed None and took down the request
-    # inside the research pipeline's `.astype(int)` - a 500 for a field the
-    # schema calls optional. Set by assignment rather than inside Annotated, which
-    # pydantic 2.13 warns is an unsupported position for this particular attribute.
-    cellphone: int | str | None = Field(default=None, validate_default=True)
+    # The default is 0, not None: a `before` validator does not run when the key is
+    # absent, so an omitted cellphone stayed None and took down the request inside the
+    # research pipeline's `.astype(int)` - a 500 for a field the schema calls optional.
+    # `validate_default=True` also fixed that, by running the validator over the default,
+    # but pydantic 2.13 warns that the attribute has no effect on a union-typed field
+    # wherever it is written, and FastAPI builds exactly such a standalone adapter per
+    # field. Defaulting to the value the validator would have produced needs no attribute
+    # and no warning. `None` sent explicitly still normalises, because then it is present.
+    cellphone: int | str | None = 0
+
+    @model_validator(mode="after")
+    def reject_register_before_session(self) -> RankRequest:
+        """A user cannot submit the survey materially before the session that showed it.
+
+        `from_start_to_register` is register_date minus session_dt, and every training row
+        has it positive: the survey is submitted during the session. An inverted pair
+        produced -86,400 seconds behind a 200 - a feature 3.4 million standard deviations
+        outside anything the model was fitted on, scored confidently.
+
+        A minute of tolerance rather than zero, because a few seconds of clock skew between
+        two services is ordinary and is not what this is for. A day is not skew.
+        """
+        if self.register_date is None:
+            return self
+        session = datetime.strptime(self.session_dt, TIMESTAMP_FORMAT)
+        register = datetime.strptime(self.register_date, TIMESTAMP_FORMAT)
+        if register < session - _CLOCK_SKEW_TOLERANCE:
+            raise ValueError(
+                f"register_date {self.register_date} is before session_dt {self.session_dt} "
+                f"by more than {int(_CLOCK_SKEW_TOLERANCE.total_seconds())}s. The survey "
+                f"cannot be submitted before the session that showed it, and the feature "
+                f"derived from the two would be negative - which training never sees."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -273,8 +324,18 @@ def _normalise_timestamp(value: Any, required: bool) -> str | None:
     # so the request is refused instead of guessed at.
     if isinstance(value, bool | int | float):
         raise ValueError(
-            f"expected a timestamp string, got the number {value!r}. pandas would read "
+            f"expected a timestamp string, got the number {_shown(value)}. pandas would read "
             f"it as nanoseconds since 1970; send it as '%Y-%m-%d %H:%M:%S' text."
+        )
+    # pandas reads 'now' and 'today' as the current time, so a funnel sending either had
+    # its own timestamp silently replaced by the server's clock - and session_day,
+    # session_day_of_week and session_hour became today's, behind a 200. A timestamp has
+    # digits in it; a relative keyword does not.
+    if isinstance(value, str) and not any(char.isdigit() for char in value):
+        raise ValueError(
+            f"{_shown(value)} is not a parseable timestamp. Relative keywords like 'now' and "
+            f"'today' are refused for the same reason rather than resolved: pandas would "
+            f"read them against this server's clock instead of the funnel's own time."
         )
     if isinstance(value, datetime):
         parsed = value
@@ -284,7 +345,7 @@ def _normalise_timestamp(value: Any, required: bool) -> str | None:
             raise ValueError(f"expected a single timestamp, got {type(parsed).__name__}")
         if parsed is pd.NaT or pd.isna(parsed):
             if required:
-                raise ValueError(f"{value!r} is not a parseable timestamp")
+                raise ValueError(f"{_shown(value)} is not a parseable timestamp")
             return None
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(UTC).replace(tzinfo=None)
@@ -296,7 +357,7 @@ def _normalise_timestamp(value: Any, required: bool) -> str | None:
     naive = parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
     if not (_TIMESTAMP_MIN <= naive <= _TIMESTAMP_MAX):
         raise ValueError(
-            f"{value!r} is outside the representable timestamp range "
+            f"{_shown(value)} is outside the representable timestamp range "
             f"({_TIMESTAMP_MIN:%Y-%m-%d}..{_TIMESTAMP_MAX:%Y-%m-%d})"
         )
     return parsed.strftime(TIMESTAMP_FORMAT)

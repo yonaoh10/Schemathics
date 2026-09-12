@@ -16,10 +16,19 @@ name: bl-ranking
 
 services:
 
-# Default backend note: neither image installs the `tabpfn` extra (torch is ~2.5 GB),
-# so `tabpfn_local` cannot be constructed in them. The default here is the one backend
-# that always works offline; override it once for every service with, e.g.
+# Default backend note: neither image installs the `tabpfn` extra (torch is ~2.5 GB), so
+# `tabpfn_local` cannot be constructed in them. The default below is the one backend that
+# always works offline. Override it for the *training* services with, e.g.
 #   BL_PAYOUT_BACKEND=tabpfn_client TABPFN_TOKEN=... docker compose up
+# which is training and scheduler only - api reads BL_SERVING_PAYOUT_BACKEND, on purpose,
+# for the reason spelled out on that service below.
+#
+# The serving image installs the `serve` extra, which has no TabPFN of either kind. A
+# bundle trained with tabpfn_client therefore degrades to catboost_fallback when this image
+# loads it, rather than failing: the funnel's synchronous path keeps answering, and every
+# response carries `payout_backend`, so a degraded endpoint says so on every request. Add
+# tabpfn-client to the `serve` extra if exact hosted payouts are wanted at serve time -
+# and note that it puts a network call on the request path.
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.19.0
@@ -96,9 +105,15 @@ services:
       BL_MODEL__PAYOUT__BACKEND: ${BL_SERVING_PAYOUT_BACKEND:-}
       BL_SERVING__WORKERS: ${BL_SERVING_WORKERS:-3}
       BL_SERVING__THREADS_PER_WORKER: "1"
+      # Where the workers share their Prometheus counters, so one scrape covers all three
+      # instead of the one that answered it (scripts/serve.sh sets this up). Deliberately
+      # outside the /app bind mount: the files are named by pid, and the host's pids are
+      # not the container's, so a shared directory would merge two unrelated processes.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/bl-metrics
     volumes:
       - ..:/app
-    # Each worker holds its own copy of the model and the gender table (~400 MB).
-    # Sized for 3 workers with headroom; raise alongside BL_SERVING__WORKERS.
+    # Each worker holds its own copy of the model and the gender table: 866 MB resident
+    # measured warm, 688 MB of it private, so three workers come to 2.1 GB. Sized for that
+    # with headroom; raise alongside BL_SERVING__WORKERS.
     mem_limit: 4g
     restart: unless-stopped

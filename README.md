@@ -77,7 +77,7 @@ curl -s localhost:8080/rank -H 'content-type: application/json' -d '{
   },
   "meta": {
     "model_version": "fe0373d4f372...", "payout_backend": "surrogate",
-    "payout_exact": false, "n_brands": 15, "latency_ms": 1.9
+    "payout_exact": false, "brands_ranked": 15, "latency_ms": 1.9
   }
 }
 ```
@@ -166,7 +166,10 @@ Both rows of "fitted on" are the same, and that is not a typo. `bl_preprocessing
 `split_by_time(bl_data, days_for_test=7)` unconditionally and fits on the earlier part, so
 the most recent week is held back in production mode too — it is simply never scored
 there. This table said "everything" for a long time, and the bundle manifest reported the
-snapshot size as `rows_train`, which overstated it by about a tenth. Training on the full
+snapshot size as `rows_train`, which on the real extract overstated it by 23% — 81,002
+against 65,727 actually fitted. The 7-day split accounts for 8,512 of that gap; the rest is
+the research pipeline's own row drops, which happen before it (no register_date, then fewer
+than five survey answers). Training on the full
 window would mean editing the given code, so the run reports the truth instead:
 `split.rows_fitted` and `split.rows_held_out` are what the models saw, `data.rows` is what
 was read.
@@ -426,7 +429,12 @@ question independent of latency.
 | `GET /healthz` | liveness — the process is up |
 | `GET /readyz` | readiness — models loaded **and** a real scoring call succeeded |
 | `GET /model` | the serving version, backend, brand count |
-| `GET /metrics` | Prometheus |
+| `GET /metrics` | Prometheus: request rate and outcome, latency histogram, and `bl_rank_band_sentinel_total` — merged across all workers, not just the one that answered the scrape |
+
+`bl_rank_band_sentinel_total{feature=...}` counts requests whose survey answer matched no
+band and so landed on the `-99` sentinel. It is the one metric here that catches a *content*
+change rather than a code one: rename an answer in the funnel copy and every user scores as
+though their credit score were unknown, with a 200 and no error anywhere.
 
 A request the models cannot score gets a 422 naming the reason, not a generic validation
 failure, because the funnel has to know which of the two it is:
@@ -443,6 +451,15 @@ as a generic validation failure - and on the research path it came back as a 500
 the research code raises a bare `Exception` for it that the endpoint's handler cannot
 catch. A `register_date` that is present but unreadable is still a validation error: a
 broken date format is not a user who cannot be a lead.
+
+A body over `serving.max_body_bytes` (64 KB, against a payload of about 1 KB) gets a 413
+and is never parsed. Unbounded, it was the cheapest way to take the endpoint down: on one
+worker, eight connections posting 1 MB bodies took valid `/rank` p50 from 7.8 ms to 404 ms
+and cut what it answered in eight seconds from 123 requests to 19, because reading and
+rejecting a body happens on the event loop. A single 32 MB body cost 2.0 s and came back as
+a 33.5 MB error, since the validator quoted the value it refused — so the messages are
+bounded too, and still name enough of the value to act on. Refusing above the limit costs
+0.05 ms, and with it in place the same flood leaves p50 at 14.7 ms.
 
 ### What made it fast
 

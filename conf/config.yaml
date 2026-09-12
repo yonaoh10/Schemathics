@@ -96,6 +96,10 @@ serving:
   # fast     - vectorised feature path, ~50ms of pandas overhead removed (default)
   # research - the research pipeline verbatim; the reference the fast path is tested against
   feature_path: fast
+  # Largest request body accepted. One funnel session is ~1 KB. Anything larger is read,
+  # parsed and rejected on the event loop, so the cap is a latency control as much as a
+  # size one: 32 MB of nonsense used to cost the worker two seconds of answering nobody.
+  max_body_bytes: 65536
 
 schedule:
   # Weekly production retrain, Sunday 05:00. Databricks wants a Quartz expression;

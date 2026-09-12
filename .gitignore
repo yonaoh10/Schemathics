@@ -21,5 +21,9 @@ venv/
 # TabPFN foundation weights (44 MB), fetched on demand.
 .tabpfn_models/
 
+# Shared Prometheus counter files, one per worker per metric type. Recreated by
+# scripts/serve.sh on every start.
+/.metrics/
+
 # Secrets
 .env

@@ -255,3 +255,17 @@ def test_a_named_config_file_that_is_missing_is_an_error(tmp_path, monkeypatch):
     monkeypatch.setenv("BL_CONFIG", str(tmp_path / "not-there.yaml"))
     with pytest.raises(FileNotFoundError, match="does not exist"):
         Settings.load()
+
+
+@pytest.mark.parametrize("value", ["0", "512", "-1"])
+def test_a_body_limit_below_one_payload_is_refused(monkeypatch, value):
+    """The limit exists to keep an oversized body off the event loop, and one ordinary
+    payload is about 1 KB. Set below that it refuses ordinary traffic instead - a 413 for
+    every request, from a number that looks like a tightening."""
+    with pytest.raises(ValueError, match="max_body_bytes"):
+        _load(monkeypatch, BL_SERVING__MAX_BODY_BYTES=value)
+
+
+def test_a_raised_body_limit_is_accepted(monkeypatch):
+    """An operator whose payload genuinely grew must be able to raise it."""
+    assert _load(monkeypatch, BL_SERVING__MAX_BODY_BYTES="262144").serving.max_body_bytes == 262144

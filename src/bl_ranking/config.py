@@ -128,6 +128,12 @@ class ServingSettings:
     model_uri: str | None = None
     # "fast" (default) or "research". See serving/fast_features.py.
     feature_path: str = "fast"
+    # The largest request body the endpoint will read. A /rank payload is one funnel
+    # session, ~1 KB; 64 KB is two orders of magnitude of headroom. Before the limit
+    # existed a caller could post an arbitrarily large body and the worker would read,
+    # parse and reject all of it on the event loop - 32 MB of it cost 2 s, during which
+    # that worker answered nobody. Raise it if the payload ever genuinely grows.
+    max_body_bytes: int = 64 * 1024
 
 
 @dataclass
@@ -194,6 +200,12 @@ class Settings:
             raise ValueError(
                 f"serving.threads_per_worker must be at least 1, "
                 f"got {self.serving.threads_per_worker}"
+            )
+        if self.serving.max_body_bytes < 1024:
+            raise ValueError(
+                f"serving.max_body_bytes must be at least 1024, got "
+                f"{self.serving.max_body_bytes} - a /rank payload is about 1 KB, so a "
+                f"smaller limit refuses ordinary traffic"
             )
         if not 1 <= self.serving.port <= 65535:
             raise ValueError(f"serving.port must be 1..65535, got {self.serving.port}")

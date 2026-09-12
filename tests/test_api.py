@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -415,3 +417,226 @@ def test_the_model_endpoint_says_where_its_bundle_came_from(client):
 
     source = client.get("/model").json()["bundle_source"]
     assert source in {BUNDLE_SOURCE_LOCAL, BUNDLE_SOURCE_PINNED, BUNDLE_SOURCE_REGISTRY}
+
+
+def test_a_renamed_funnel_answer_shows_up_as_a_metric(client, example_user):
+    """docs/design.md promised this signal before it existed. A copy change that renames a
+    survey answer sends every user to the -99 band sentinel silently: the feature still has
+    a value, the request still succeeds with a 200, and the loss shows up as revenue rather
+    than as an error."""
+    from bl_ranking.serving.app import BAND_SENTINELS
+
+    before = BAND_SENTINELS.labels("credit_score_num")._value.get()
+    assert client.post("/rank", json=example_user).status_code == 200
+    assert BAND_SENTINELS.labels("credit_score_num")._value.get() == before
+
+    renamed = {**example_user, "credit_score": "Reasonably Good"}
+    assert client.post("/rank", json=renamed).status_code == 200
+    assert BAND_SENTINELS.labels("credit_score_num")._value.get() == before + 1
+
+
+def test_the_two_brand_counts_have_two_names(client, example_user):
+    """GET /model reports `n_brands` as the size of the brand universe; the response meta
+    reports how many came back for this user. They were the same name for two different
+    quantities, so a partial ranking read as a shrunken universe."""
+    meta = client.post("/rank", json=example_user).json()["meta"]
+    info = client.get("/model").json()
+
+    assert "n_brands" not in meta
+    assert meta["brands_ranked"] == len(
+        client.post("/rank", json=example_user).json()["ranking"])
+    assert info["n_brands"] >= meta["brands_ranked"]
+
+
+def test_a_worker_with_no_model_is_visible_on_the_dashboard(client, monkeypatch):
+    """A worker whose model failed to load answers every request 503 while emitting no
+    request metrics at all, so it looked exactly like a worker nobody was calling."""
+    from bl_ranking.serving import app as app_module
+
+    before = app_module.REQUESTS.labels("not_ready")._value.get()
+    monkeypatch.setattr(app_module.state, "ranker", None)
+    assert client.post("/rank", json={}).status_code in (422, 503)
+    monkeypatch.setattr(app_module.state, "ranker", None)
+    assert client.get("/model").status_code == 503
+    assert app_module.REQUESTS.labels("not_ready")._value.get() > before
+
+
+@pytest.mark.parametrize("keyword", ["now", "today"])
+def test_a_relative_keyword_is_not_a_timestamp(client, example_user, keyword):
+    """pandas resolves both against the server's clock, so a funnel sending either had its
+    own timestamp silently replaced - and session_day, session_day_of_week and session_hour
+    became today's, behind a 200."""
+    response = client.post("/rank", json={**example_user, "session_dt": keyword})
+    assert response.status_code == 422
+    assert "Relative keywords" in str(response.json()["detail"])
+
+
+@pytest.mark.parametrize(("register", "accepted"), [
+    ("2026-01-06 19:26:07", True),      # the survey after the session, as always
+    ("2026-01-06 19:24:00", True),      # 22 s early: clock skew between two services
+    ("2026-01-06 19:20:00", False),     # four minutes early
+    ("2026-01-05 19:26:07", False),     # a day early
+])
+def test_a_time_inverted_funnel_is_refused(client, example_user, register, accepted):
+    """from_start_to_register is register_date minus session_dt and every training row has
+    it positive. An inverted pair produced -86,400 seconds behind a 200 - a value millions
+    of standard deviations outside anything the model was fitted on, scored confidently."""
+    payload = {**example_user, "session_dt": "2026-01-06 19:24:22", "register_date": register}
+    response = client.post("/rank", json=payload)
+    if accepted:
+        assert response.status_code == 200
+    else:
+        assert response.status_code == 422
+        assert "before session_dt" in str(response.json()["detail"])
+
+
+@pytest.fixture
+def other_worker(tmp_path_factory):
+    """A directory holding the metrics of a worker in another process, now exited.
+
+    Function-scoped, and each caller gets a fresh directory: reading /metrics deletes the
+    live-gauge files of workers that have gone, so two tests sharing one directory would
+    have the first sweep away what the second is about to look for.
+
+    Production runs `serving.workers` uvicorn processes and every metric in app.py is a
+    module-level object, so each worker counts only its own traffic. This fixture is the
+    other workers: a real second process that records some requests and then dies, leaving
+    its counters in the shared directory for the scrape to find.
+    """
+    import os
+    import subprocess
+    import sys
+
+    directory = tmp_path_factory.mktemp("multiproc")
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ,
+           "PROMETHEUS_MULTIPROC_DIR": str(directory),
+           "PYTHONPATH": str(root / "src"),
+           # The child only touches counters; loading a model would make it slow for
+           # nothing, and the lifespan hook that loads one is never entered on import.
+           "BL_SERVING__WORKERS": "3"}
+    program = (
+        "from bl_ranking.serving import app\n"
+        "for _ in range(7): app.REQUESTS.labels('ok').inc()\n"
+        # A worker whose model failed to load. The interesting case for readiness: it must
+        # not be averaged away by the workers that did load, and must not outlive itself.
+        "app.READY.set(0)\n"
+    )
+    subprocess.run([sys.executable, "-c", program], check=True, env=env, timeout=600)
+    return directory
+
+
+def test_a_scrape_covers_the_workers_that_did_not_answer_it(client, monkeypatch, other_worker):
+    """One scrape must report the whole service, not the worker it happened to reach.
+
+    With the documented 3 workers, a plain registry gave a scrape one worker's counters:
+    bl_rank_requests_total read about a third of the traffic and the latency histogram was
+    one worker's p99. Both are numbers an operator sizes capacity from, and being wrong low
+    by two thirds is worse than not having them.
+    """
+    from bl_ranking.serving import app as app_module
+
+    monkeypatch.setattr(app_module, "MULTIPROC_DIR", str(other_worker))
+    body = client.get("/metrics").text
+    # 7 requests that this process never saw, and would not have reported.
+    assert 'bl_rank_requests_total{outcome="ok"} 7.0' in body
+
+
+def test_a_dead_workers_readiness_does_not_outlive_it(client, monkeypatch, other_worker):
+    """`livemin` means "across the workers that are alive", which needs the files of the
+    others deleted - prometheus_client leaves that to the application, and uvicorn offers
+    no worker-exit hook. Without the sweep, one worker that failed to load would pin
+    bl_rank_ready to 0 for the lifetime of the service, including after it was replaced by
+    a healthy one.
+    """
+    from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+
+    from bl_ranking.serving import app as app_module
+
+    library = CollectorRegistry()
+    multiprocess.MultiProcessCollector(library, path=str(other_worker))
+    assert "bl_rank_ready 0.0" in generate_latest(library).decode()
+
+    monkeypatch.setattr(app_module, "MULTIPROC_DIR", str(other_worker))
+    body = client.get("/metrics").text
+    assert "bl_rank_ready 0.0" not in body
+    # The requests it served still count: only the gauge describes a state that died with it.
+    assert 'bl_rank_requests_total{outcome="ok"} 7.0' in body
+
+
+# --- Request size ---------------------------------------------------------------------
+#
+# Nothing bounded the request body. Measured on one worker, eight connections posting 1 MB
+# bodies took valid /rank p50 from 7.8 ms to 404 ms and cut the requests it answered in
+# eight seconds from 123 to 19; a single 32 MB body cost 2.0 s and came back as a 33.5 MB
+# error, because the validator quoted the value it refused. The sender paid nothing for
+# either. 64 KB is 60x an ordinary payload and refusing above it costs 0.05 ms.
+
+def test_a_body_over_the_limit_is_refused_without_being_parsed(client):
+    """413, not 422: the difference says whether the caller should fix their payload or
+    stop sending 1 MB of it. And it must not be parsed first - parsing is the cost."""
+    from bl_ranking.serving import app as app_module
+
+    limit = app_module.state.settings.serving.max_body_bytes
+    before = app_module.REQUESTS.labels("too_large")._value.get()
+    # Valid JSON, and valid against the schema up to the size: the point is that the size
+    # decides, before anything looks at the content.
+    response = client.post("/rank", content=b'{"session_dt": "' + b"x" * (limit + 1) + b'"}',
+                           headers={"content-type": "application/json"})
+    assert response.status_code == 413
+    assert str(limit) in response.json()["detail"]
+    assert app_module.REQUESTS.labels("too_large")._value.get() == before + 1
+
+
+def test_a_body_the_client_does_not_measure_is_still_limited(client):
+    """Chunked transfer sends no Content-Length, so the size is only knowable by counting.
+    A limit that a caller can bypass by omitting a header is not a limit."""
+    def chunks():
+        for _ in range(40):
+            yield b"x" * 4096
+
+    response = client.post("/rank", content=chunks(),
+                           headers={"content-type": "application/json"})
+    assert response.status_code == 413
+
+
+def test_a_body_under_the_limit_is_unaffected(client, example_user):
+    """The limit must be invisible to ordinary traffic, including on the counted path:
+    reading the body to measure it and replaying it to the app has to be lossless."""
+    import json as jsonlib
+
+    encoded = jsonlib.dumps(example_user).encode()
+
+    def one_chunk():
+        yield encoded
+
+    assert client.post("/rank", json=example_user).status_code == 200
+    streamed = client.post("/rank", content=one_chunk(),
+                           headers={"content-type": "application/json"})
+    assert streamed.status_code == 200
+    assert streamed.json()["ranking"]
+
+
+def test_a_rejection_does_not_echo_the_value_it_rejected(client, example_user):
+    """A 422 that quotes its input is an amplifier: 32 MB in, 33.5 MB out, built on the
+    event loop. The message still names the value, which is what makes it actionable -
+    just bounded, so the response size is a property of this service and not of the
+    caller's payload."""
+    long_value = "9" * 20_000                    # under the body limit, so it is validated
+    response = client.post("/rank", json={**example_user, "session_dt": long_value})
+    assert response.status_code == 422
+    assert len(response.content) < 2_000
+    message = response.json()["detail"][0]["msg"]
+    assert "characters" in message               # says how much was withheld
+    assert long_value not in message
+
+
+def test_a_long_message_is_clipped_even_if_a_validator_forgets():
+    """The bound is enforced where the body is written too, not only where the messages
+    are. A validator added later cannot reopen this by quoting its input in full."""
+    from bl_ranking.serving.app import MAX_MESSAGE_CHARS, _clipped
+
+    assert _clipped("short") == "short"
+    clipped = _clipped("x" * 5000)
+    assert len(clipped) < MAX_MESSAGE_CHARS + 60
+    assert "5000 characters" in clipped
