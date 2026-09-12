@@ -21,8 +21,9 @@ Contents
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,9 @@ GENDER_LOOKUP_FILE = "gender_lookup.parquet"   # models/gender_lut.ARTIFACT_NAME
 
 # The single column all_clients.csv carries, and the name the research code joins on.
 CLIENT_NAME_COLUMN = "client_name"
+
+
+log = logging.getLogger("bl_ranking.models")
 
 
 @dataclass
@@ -64,10 +68,25 @@ class Manifest:
 
     @classmethod
     def read(cls, directory: Path) -> Manifest:
+        """Read a manifest, tolerating fields this version does not know about.
+
+        Rollback reads old bundles, but a worker also reads bundles written by a
+        *newer* pipeline - during a rolling deploy, every old replica does. Passing the
+        JSON straight into the constructor made one added field a TypeError that
+        bricked the worker, so shipping a new manifest key would have taken down the
+        fleet it was meant to roll through. Unknown keys are recorded and ignored;
+        missing ones keep their defaults, which is the other half of the same problem.
+        """
         path = Path(directory) / MANIFEST_FILE
         if not path.exists():
             return cls()
-        return cls(**json.loads(path.read_text()))
+        raw = json.loads(path.read_text())
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(raw) - known)
+        if unknown:
+            log.info("manifest at %s carries unknown field(s) %s; ignoring them. This "
+                     "bundle was probably written by a newer version.", path, unknown)
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     def as_tags(self) -> dict[str, str]:
         """The subset worth having on the MLflow run and the registered version."""

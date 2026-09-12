@@ -152,8 +152,12 @@ end-to-end script is the estimate. Both are kept, labelled for what they are.
 **The uncomfortable part, stated plainly.** The surrogate changes predictions. I did not
 want to hide that behind a config default, so: the distillation step measures itself
 against the teacher (MAE, MAPE, Spearman) and logs the result to MLflow on every run;
-every model version is tagged `payout_exact`; and every HTTP response carries
-`payout_exact: false`. If the business needs TabPFN's exact numbers on the synchronous
+every model version is tagged `payout_exact`; and the `/rank` response and the MLflow
+pyfunc both carry `payout_exact: false`. (`/rank/bare` does not, and deliberately so -
+it exists to return the research function's dictionary verbatim for a caller that
+already consumes that shape, so anything added to it would defeat its only purpose.
+`/rank` is the endpoint to use when the model identity matters, which is most of the
+time.) If the business needs TabPFN's exact numbers on the synchronous
 path, the honest answer is a GPU endpoint or an asynchronous design — not a faster CPU.
 
 Two smaller decisions with production consequences. The hosted checkpoint is **pinned**:

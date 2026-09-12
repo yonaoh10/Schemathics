@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -78,7 +78,7 @@ class RankRequest(BaseModel):
     # so without this an omitted cellphone stayed None and took down the request
     # inside the research pipeline's `.astype(int)` - a 500 for a field the
     # schema calls optional.
-    cellphone: int | str | None = Field(default=None, validate_default=True)
+    cellphone: Annotated[int | str | None, Field(validate_default=True)] = None
 
     @field_validator("session_dt", "register_date", mode="before")
     @classmethod

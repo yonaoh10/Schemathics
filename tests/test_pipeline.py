@@ -922,3 +922,30 @@ def test_an_impossible_quartz_day_is_rejected():
     with pytest.raises(ValueError, match="outside 1-7"):
         parse_quartz("0 0 5 ? * 9 *")
 
+@pytest.mark.parametrize("mutate", [
+    lambda m: m.update({"a_field_from_a_newer_version": "x"}),
+    lambda m: m.pop("git_sha", None),
+])
+def test_a_manifest_from_a_different_version_still_loads(bundle, settings, tmp_path, mutate):
+    """A rolling deploy has old replicas reading bundles written by the new pipeline.
+
+    Passing the JSON straight into the constructor made one added field a TypeError
+    that bricked the worker, so shipping a new manifest key would have taken down the
+    fleet it was meant to roll through. Missing keys are the same problem from the
+    other side, when an old bundle is read after a rollback.
+    """
+    import json
+    import shutil
+
+    from bl_ranking.models import bundle as bundle_files
+    from bl_ranking.serving.ranker import BrandRanker
+
+    other = tmp_path / "bundle"
+    shutil.copytree(bundle, other)
+    path = other / bundle_files.MANIFEST_FILE
+    manifest = json.loads(path.read_text())
+    mutate(manifest)
+    path.write_text(json.dumps(manifest))
+
+    assert BrandRanker.load(other, settings) is not None
+
