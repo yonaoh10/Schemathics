@@ -125,14 +125,36 @@ class BrandRanker:
                                  name=backend_name, on_fallback=_log_fallback)
 
         gender_path = directory / GENDER_ARTIFACT
-        gender = GenderLookup.load(gender_path) if gender_path.exists() else None
-        if gender is None:
+        if gender_path.exists():
+            gender = GenderLookup.load(gender_path)
+        else:
+            # A bundle built with model.build_gender_lookup off. The fallback used to
+            # be logged but not performed: the vectorised path answered 'unknown' for
+            # every name while the research path did the real lookup, so the two
+            # implementations disagreed on a model feature with nothing to show for it.
             log.warning(
-                "%s not found in the bundle; falling back to the live names-dataset "
-                "lookup (18s start-up, 2.4GB resident)", GENDER_ARTIFACT,
+                "%s not in the bundle; using the live names-dataset lookup instead "
+                "(18s start-up, 2.4GB resident). Rebuild with model.build_gender_lookup "
+                "enabled to avoid both.", GENDER_ARTIFACT,
             )
+            try:
+                gender = GenderLookup.live()
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"Model bundle at {directory} has no {GENDER_ARTIFACT} and "
+                    f"names-dataset is not installed, so the gender feature cannot be "
+                    f"computed at all. Rebuild the bundle with "
+                    f"model.build_gender_lookup enabled."
+                ) from exc
 
         all_clients = pd.read_csv(directory / bundle_files.CLIENTS_FILE)
+        if all_clients.empty:
+            # Every request would return 200 with an empty ranking while /readyz stayed
+            # green: a total outage that looks like a healthy service from the outside.
+            raise ValueError(
+                f"Model bundle at {directory} has an empty brand universe "
+                f"({bundle_files.CLIENTS_FILE}); there is nothing to rank."
+            )
 
         install_warning_capture()
         warm = WarmModels(

@@ -502,3 +502,78 @@ def test_one_unrepresentable_id_does_not_corrupt_the_rest_of_its_column():
     assert phones[1] == 7869914030
     assert repairs["cellphone"] == 1
 
+def test_a_bundle_with_no_brands_is_refused(bundle, settings, tmp_path):
+    """An empty brand universe used to be a silent total outage.
+
+    The worker loaded, warm-up passed, /readyz went green, and every request returned
+    200 with an empty ranking - a service that looks healthy from the outside while
+    answering nothing.
+    """
+    import shutil
+
+    import pandas as pd
+    import pytest
+
+    from bl_ranking.models import bundle as bundle_files
+    from bl_ranking.serving.ranker import BrandRanker
+
+    empty = tmp_path / "bundle"
+    shutil.copytree(bundle, empty)
+    clients = empty / bundle_files.CLIENTS_FILE
+    pd.read_csv(clients).head(0).to_csv(clients, index=False)
+
+    with pytest.raises(ValueError, match="empty brand universe"):
+        BrandRanker.load(empty, settings)
+
+
+def test_a_bundle_without_a_manifest_is_refused(bundle, settings, tmp_path):
+    """The bundle is the unit of versioning; the manifest is what identifies it."""
+    import shutil
+
+    import pytest
+
+    from bl_ranking.models import bundle as bundle_files
+    from bl_ranking.serving.ranker import BrandRanker
+
+    incomplete = tmp_path / "bundle"
+    shutil.copytree(bundle, incomplete)
+    (incomplete / bundle_files.MANIFEST_FILE).unlink()
+
+    with pytest.raises(FileNotFoundError, match=bundle_files.MANIFEST_FILE):
+        BrandRanker.load(incomplete, settings)
+
+
+def test_the_pyfunc_reports_errors_beside_the_ranking_not_inside_it(bundle, settings):
+    """The MLflow path is a serving surface and owes the same contract as HTTP.
+
+    A failing row used to come back as a ranking containing a brand named __error__
+    whose value was a string, where every real entry is a {rank, expected_payout}
+    object. Any consumer iterating the ranking either crashed or treated the message
+    as a lender. It also skipped request validation entirely, so a row's features
+    depended on which other rows shared its batch.
+    """
+    import json
+
+    import pandas as pd
+
+    from bl_ranking.serving.pyfunc import BrandRankerModel
+    from bl_ranking.serving.ranker import WARMUP_USER, BrandRanker
+
+    model = BrandRankerModel()
+    model._ranker = BrandRanker.load(bundle, settings)
+
+    good = dict(WARMUP_USER)
+    malformed = dict(WARMUP_USER) | {"session_dt": "not a date"}
+    frame = model.predict(None, pd.DataFrame([good, malformed]))
+
+    assert "error" in frame.columns
+    for payload in frame["ranking"]:
+        assert "__error__" not in json.loads(payload)
+
+    assert frame["error"][0] is None
+    assert frame["error"][1] is not None
+
+    # The same row scored alone must give the same answer as in a mixed batch.
+    alone = model.predict(None, pd.DataFrame([good]))["ranking"][0]
+    assert json.loads(alone) == json.loads(frame["ranking"][0])
+

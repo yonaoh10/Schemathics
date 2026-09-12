@@ -32,6 +32,7 @@ CATBOOST_FILE = "CB_bl_lead.cbm"
 PAYOUT_CONTEXT_FILE = "payout_tfm_context.joblib"
 CLIENTS_FILE = "all_clients.csv"
 MANIFEST_FILE = "manifest.json"
+GENDER_LOOKUP_FILE = "gender_lookup.parquet"   # models/gender_lut.ARTIFACT_NAME
 
 
 @dataclass
@@ -102,6 +103,12 @@ def utc_now() -> str:
 
 
 def verify(directory: Path) -> list[str]:
-    """Return the list of required files that are missing. Empty list means valid."""
-    required = [CATBOOST_FILE, PAYOUT_CONTEXT_FILE, CLIENTS_FILE]
+    """Return the list of required files that are missing. Empty list means valid.
+
+    The manifest is required too. The gender table deliberately is not: building it is
+    a config flag (`model.build_gender_lookup`), so a bundle without one is legitimate.
+    Serving handles its absence by doing the live lookup instead - see ranker.load -
+    rather than by quietly filling the feature with a constant.
+    """
+    required = [CATBOOST_FILE, PAYOUT_CONTEXT_FILE, CLIENTS_FILE, MANIFEST_FILE]
     return [name for name in required if not (Path(directory) / name).exists()]

@@ -29,10 +29,12 @@ from typing import Any
 import mlflow
 import pandas as pd
 from mlflow.models import ModelSignature, infer_signature
+from pydantic import ValidationError
 
 from bl_ranking.config import Settings
 from bl_ranking.data.schema import REQUEST_FIELDS
 from bl_ranking.serving.ranker import WARMUP_USER, BrandRanker, InsufficientSurveyData
+from bl_ranking.serving.schemas import RankRequest
 
 BUNDLE_ARTIFACT_KEY = "bundle"
 
@@ -59,20 +61,47 @@ class BrandRankerModel(mlflow.pyfunc.PythonModel):
 
         frame = _as_frame(model_input)
         rankings: list[str] = []
+        errors: list[str | None] = []
         for record in frame.to_dict(orient="records"):
+            ranking: dict[str, Any] = {}
+            error: str | None = None
             try:
-                ranking = self._ranker.rank(record)
+                # The same validation the HTTP endpoint applies. Without it this path
+                # accepted whatever pandas happened to infer for a column, so a row's
+                # features depended on which other rows shared its batch - a null in
+                # one row could turn every id in the column into a float. Validating
+                # each record on its own removes that coupling and applies one contract
+                # to both serving surfaces.
+                user = RankRequest(**_scrub(record)).to_user_data()
+            except ValidationError as exc:
+                errors.append(f"invalid_request: {exc.error_count()} field(s)")
+                rankings.append(json.dumps({}))
+                continue
+            try:
+                ranking = self._ranker.rank(user)
             except InsufficientSurveyData:
-                ranking = {}
+                error = "insufficient_survey_answers"
             except Exception as exc:  # noqa: BLE001 - one bad row must not fail a batch
-                ranking = {"__error__": str(exc)}
+                error = f"{type(exc).__name__}: {exc}"
             rankings.append(json.dumps(ranking))
+            errors.append(error)
+        # `error` is its own column. It used to be smuggled into the ranking as a brand
+        # named __error__ whose value was a string where every real entry is a
+        # {rank, expected_payout} object, so any consumer that iterated the ranking
+        # either crashed or silently treated the message as a lender.
         return pd.DataFrame({
             "ranking": rankings,
+            "error": errors,
             "payout_backend": [backend] * len(rankings),
             "payout_exact": [exact] * len(rankings),
         })
 
+
+
+def _scrub(record: dict[str, Any]) -> dict[str, Any]:
+    """pandas renders a missing value as NaN; the request schema expects None."""
+    return {k: (None if not isinstance(v, str) and pd.isna(v) else v)
+            for k, v in record.items()}
 
 def _as_frame(model_input: Any) -> pd.DataFrame:
     if isinstance(model_input, pd.DataFrame):
@@ -91,6 +120,7 @@ def build_signature() -> ModelSignature:
     example = request_example()
     output = pd.DataFrame({
         "ranking": ['{"brand": {"rank": 1.0, "expected_payout": 42.31}}'],
+        "error": [None],
         "payout_backend": ["surrogate"],
         "payout_exact": [False],
     })

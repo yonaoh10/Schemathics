@@ -59,6 +59,19 @@ class GenderLookup:
         return cls(dict(mapping))
 
     @classmethod
+    def live(cls) -> GenderLookup:
+        """A lookup backed by names-dataset itself, for a bundle built without a table.
+
+        Same interface, same answers, and the same 2.4 GB the table exists to avoid -
+        which is why it is only reached when `model.build_gender_lookup` was off. The
+        alternative, and what used to happen, is that the vectorised path answered
+        'unknown' for every name while the research path did the real lookup, so the
+        two implementations silently stopped agreeing on a model feature.
+        """
+        dataset = _loaded_dataset() or _new_dataset()
+        return _LiveGenderLookup(dataset)
+
+    @classmethod
     def load(cls, path: str | Path) -> GenderLookup:
         table = pq.read_table(path)
         names = table.column("name").to_pylist()
@@ -150,3 +163,17 @@ def _detect(dataset, fname: str) -> tuple[str, float]:
     if male >= female:
         return "male", round(male / total, 3)
     return "female", round(female / total, 3)
+
+
+class _LiveGenderLookup(GenderLookup):
+    """GenderLookup backed by a names-dataset instance rather than a materialised table."""
+
+    def __init__(self, dataset) -> None:  # noqa: D107 - see GenderLookup.live
+        super().__init__({})
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        return 0
+
+    def lookup(self, fname: str) -> tuple[str, float]:
+        return _detect(self._dataset, fname)
