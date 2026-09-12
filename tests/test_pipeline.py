@@ -56,7 +56,9 @@ def test_sanitise_enforces_the_research_code_input_contract():
 
     frame = pd.DataFrame({
         "cellphone": ["(305) 555-0142", "+1 786 991 4030", "n/a", "", 7869914030],
-        "credit_score": [None] * 5,                  # all-null -> float64 without help
+        # Numeric survey codes: an object column of ints still refuses `.str`, so the
+        # gate has to null them rather than merely move the dtype.
+        "credit_score": ["550-599", 7, None, "720+", 9],
         "industry": ["construction"] * 5,
         "loan_amount": ["$25,000 - $49,999"] * 5,
         "loan_reason": ["Payroll"] * 5,
@@ -79,8 +81,11 @@ def test_sanitise_enforces_the_research_code_input_contract():
     assert clean.loc[1, "cellphone"] == 7869914030
     assert repairs["cellphone"] == 2                 # 'n/a' and ''
 
-    # 2. survey columns must support the .str accessor
-    clean["credit_score"].astype("object").str.lower()
+    # 2. survey columns must support the .str accessor as they stand, with no help
+    #    from the caller - the vendored code calls it on whatever pandas hands it.
+    clean["credit_score"].str.lower()
+    assert list(clean["credit_score"])[:2] == ["550-599", None]
+    assert repairs["survey_nonstring"] == 2          # the 7 and the 9
 
     # 3. payout must be numeric
     assert pd.api.types.is_numeric_dtype(clean["payout"])
@@ -674,7 +679,41 @@ def test_every_registry_backend_counts_as_authoritative(settings, monkeypatch, u
     from bl_ranking.serving.model_source import _registry_is_authoritative
 
     monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
     assert _registry_is_authoritative(settings) is authoritative
+
+
+@pytest.mark.parametrize(("uri", "authoritative"), [
+    # Unity Catalog's own spelling, which carries no scheme separator and was read as a
+    # relative directory - the fallback left live on the most administered setup there is.
+    ("databricks-uc", True),
+    ("databricks-uc://profile", True),
+    # A single-slash typo is not a directory either, and reading it as one re-enabled the
+    # fallback on a deployment whose operator plainly meant a server.
+    ("http:/mlflow:5000", True),
+    ("./runs", False),
+])
+def test_the_databricks_family_and_a_typo_are_not_directories(
+        settings, monkeypatch, uri, authoritative):
+    from bl_ranking.serving.model_source import _registry_is_authoritative
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
+    assert _registry_is_authoritative(settings) is authoritative
+
+
+def test_a_registry_somewhere_else_still_counts(settings, monkeypatch):
+    """MLflow lets the registry live apart from the tracking store, and the registry is
+    what holds the alias - so reading only the tracking URI left the rollback-undoing
+    fallback live for exactly the setup where the alias is furthest away."""
+    from bl_ranking.serving.model_source import _registry_is_authoritative
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "mlruns")
+    monkeypatch.setenv("MLFLOW_REGISTRY_URI", "https://registry.internal/")
+    assert _registry_is_authoritative(settings) is True
+
+    monkeypatch.setenv("MLFLOW_REGISTRY_URI", "")
+    assert _registry_is_authoritative(settings) is False
 
 def _gate_frame(rows=3, **override):
     """A minimal well-formed extract, for tests that damage one column of it."""
@@ -1028,3 +1067,323 @@ def test_rows_needing_a_fallback_timestamp_parse_are_counted(timestamps, expecte
     assert repairs["timestamp_format_fallbacks"] == expected
     assert len(cleaned) == 3, "no row should be dropped for a format difference alone"
 
+
+
+# --------------------------------------------------------------------------------- #
+# The gate, second pass: what a real export does that a clean one does not
+# --------------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(("label", "values"), [
+    # A DST transition in an export: the same column carries two different offsets.
+    ("two offsets after a naive value",
+     ["2026-01-15 10:00:00", "2026-03-08 01:30:00-05:00", "2026-03-08 03:30:00-04:00"]),
+    # Two funnels writing the same column in two layouts.
+    ("two layouts", ["2026-01-15 10:00:00", "15/01/2026 10:00", "2026-01-16 11:00:00"]),
+])
+def test_a_heterogeneous_timestamp_column_loses_no_row(label, values):
+    """Neither pandas pass is correct alone, and each failed in its own direction.
+
+    Without `utc=True` the retry returns an object column of mixed-offset datetimes and
+    `.dt` raises on it - an AttributeError from inside the gate. Without
+    `format="mixed"` the retry infers one layout for the subset and NaTs the rest, and
+    the row filter then drops rows that parse perfectly on their own and that serving
+    accepts.
+    """
+    from bl_ranking.data.ingest import _to_utc_naive
+
+    parsed, fallbacks = _to_utc_naive(pd.Series(values, dtype="object"))
+    assert int(parsed.isna().sum()) == 0, label
+    assert fallbacks > 0, "a row that needed the second pass must be counted"
+
+
+def test_a_numeric_survey_answer_is_nulled_not_stringified():
+    """`.str.lower()` yields NaN for a non-string element and the research code then
+    fills 'other', which is exactly what serving's mirror returns for one. Stringifying
+    would put '12' in training against 'other' at serve time."""
+    from bl_ranking.data.ingest import sanitise
+
+    clean, repairs = sanitise(_gate_frame(rows=3, industry=["retail", 12, "retail"]))
+    assert list(clean["industry"]) == ["retail", None, "retail"]
+    assert repairs["survey_nonstring"] == 1
+    clean["industry"].str.lower()          # the invariant itself, unassisted
+
+
+def test_a_survey_column_with_no_text_at_all_is_refused():
+    """It cannot be repaired: its nulls become empty cells in the staged CSV, pandas
+    reads those back as float64, and `.str.lower()` raises on float64 - inside the
+    vendored code, twenty minutes into the run."""
+    from bl_ranking.data.ingest import sanitise
+
+    with pytest.raises(ValueError, match="industry"):
+        sanitise(_gate_frame(rows=3, industry=[None, None, None]))
+
+
+def test_a_repeated_required_header_is_refused():
+    """pandas renames the second copy to `payout.1`, so the missing-column check waves
+    it through and the gate reads whichever copy came first. When that is the empty one
+    the whole regression label becomes null with every repair counter reporting zero."""
+    from bl_ranking.data.ingest import REQUIRED_COLUMNS, _require_columns
+
+    frame = pd.DataFrame({c: ["x"] for c in REQUIRED_COLUMNS})
+    frame["payout.1"] = ["42.5"]
+    with pytest.raises(ValueError, match="repeats columns"):
+        _require_columns(frame)
+
+
+def test_an_id_with_a_leading_zero_survives_the_staged_csv(tmp_path):
+    """The staged CSV is where the research code actually reads, and pandas re-infers
+    dtypes there. A column of pure digits comes back as int64 whatever we write, so the
+    ids themselves have to be canonical - and serving must use the same rule."""
+    from bl_ranking.data.ingest import (
+        RESEARCH_NULL_CATEGORY,
+        _as_identifier,
+        sanitise,
+        stage_for_research_code,
+    )
+
+    clean, _ = sanitise(_gate_frame(rows=3, sub1=["007", "7448788", "12"],
+                                    sub2=["a"] * 3, sub3=["b"] * 3))
+    stage_dir, filename = stage_for_research_code(clean, tmp_path / "input")
+    reread = pd.read_csv(stage_dir / filename)
+    research_levels = list(reread["sub1"].fillna(RESEARCH_NULL_CATEGORY).astype(str))
+
+    assert research_levels == ["7", "7448788", "12"]
+    # The request boundary imports the same rule, so the two sides cannot drift.
+    assert [_as_identifier(v) for v in ("007", 7448788, "12")] == research_levels
+
+
+def test_an_id_the_round_trip_would_change_stops_the_run(tmp_path):
+    """Canonicalising covers the ids that occur; the check covers the ones that do not.
+    '1e5' is read back as 100000.0, which is a level no request can ever match."""
+    from bl_ranking.data.ingest import sanitise, stage_for_research_code
+
+    clean, _ = sanitise(_gate_frame(rows=2, sub1=["1e5", "7"]))
+    with pytest.raises(ValueError, match="round trip"):
+        stage_for_research_code(clean, tmp_path / "input")
+
+
+def test_the_ingest_report_reaches_the_training_run(tmp_path):
+    """Ingestion and training are separate jobs, so the repair counters have to be
+    persisted against the Delta version or the run cannot report the quality of the
+    rows it trained on. `as_params` had no caller at all before this."""
+    from bl_ranking.data.ingest import IngestReport, read_report
+
+    table = tmp_path / "delta" / "bl_sessions"
+    report = IngestReport(source="/x/bl_full_data.csv", rows_in=10, rows_out=9,
+                          delta_version=3, repairs={"cellphone": 2})
+    report.save(table)
+
+    loaded = read_report(table, 3)
+    assert loaded is not None
+    assert loaded.as_params()["ingest.repaired.cellphone"] == 2
+    assert loaded.as_params()["ingest.rows_out"] == 9
+    assert read_report(table, 4) is None       # a version this gate did not write
+
+
+def test_a_brand_universe_of_only_the_sentinel_is_refused(tmp_path):
+    """'other' is the research fill for a missing client_name, not a lender. n_brands
+    and _brands both drop it, so counting it in the guard let a bundle with nothing to
+    rank report /readyz green and answer every request 200 with an empty ranking."""
+    from bl_ranking.serving.ranker import _assert_usable_brand_universe
+
+    with pytest.raises(ValueError, match="empty brand universe"):
+        _assert_usable_brand_universe(
+            pd.DataFrame({"client_name": ["other"]}), tmp_path)
+    # A real universe alongside the sentinel is fine.
+    _assert_usable_brand_universe(
+        pd.DataFrame({"client_name": ["acme", "other"]}), tmp_path)
+
+
+def test_the_smallest_distillation_sample_still_fits():
+    """`fit` holds out max(1, 20% of users) whole users, so one user per brand leaves
+    nothing to fit on and CatBoost raises on an empty label vector - twenty minutes
+    into the weekly run, for a value validate() accepted."""
+    import numpy as np
+
+    from bl_ranking.models.payout import create_backend
+
+    cfg = Settings.load().model.payout
+    cfg.backend, cfg.teacher, cfg.surrogate_sample_rows = "surrogate", "catboost_fallback", 1
+    rng = np.random.RandomState(0)
+    rows, brands = 40, [f"b{i}" for i in range(15)]
+    x = pd.DataFrame({
+        "client_name": rng.choice(brands, rows),
+        "campaign_id": rng.randint(1, 5, rows).astype("int64"),
+        "page": rng.choice(["p1", "p2"], rows),
+        "from_start_to_register": rng.rand(rows) * 100,
+    })
+    fitted = create_backend(cfg, "surrogate").fit(x, pd.Series(rng.rand(rows) * 50))
+    assert fitted.fidelity["surrogate_holdout_users"] >= 1
+
+
+@pytest.mark.parametrize("start", range(1, 8))
+@pytest.mark.parametrize("end", range(1, 8))
+def test_every_quartz_day_range_fires_on_the_days_quartz_means(start, end):
+    """A Quartz range runs in Quartz's week, which starts on Sunday; APScheduler's ends
+    there. So the edges cannot be translated one at a time - '6-2' became 'fri-mon',
+    which APScheduler refuses, and because Sunday is 1 in Quartz, *every* range starting
+    on Sunday wrapped: '1-5', the ordinary weekday range, took the local runner down on
+    start-up while Databricks accepted the same expression.
+
+    Checked against what the trigger actually fires on, not against a rendered string.
+    """
+    from datetime import datetime, timedelta
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    from bl_ranking.ops.schedule import parse_quartz
+
+    # Quartz: 1=SUN..7=SAT, and a range wraps the week when start > end.
+    quartz_days = ([start] if start == end
+                   else list(range(start, end + 1)) if start < end
+                   else list(range(start, 8)) + list(range(1, end + 1)))
+    # Python's weekday(): 0=MON..6=SUN. Quartz 1 (SUN) is 6.
+    expected = {(day + 5) % 7 for day in quartz_days}
+
+    trigger = CronTrigger(timezone=UTC,
+                          **parse_quartz(f"0 0 5 ? * {start}-{end} *").as_apscheduler_kwargs())
+    fired, moment = set(), datetime(2026, 1, 1, tzinfo=UTC)
+    for _ in range(8):
+        # `None` as the previous fire time returns the next fire at or after `moment`,
+        # so step past each hit or the loop sits on the same day forever.
+        moment = trigger.get_next_fire_time(None, moment)
+        fired.add(moment.weekday())
+        moment = moment + timedelta(seconds=1)
+    assert fired == expected
+
+
+def test_an_unpromoted_registry_is_not_an_unreachable_one():
+    """The refusal to fall back locally exists to protect an operator's rollback. An
+    alias that was never set records no decision, so refusing there only made the
+    documented local stack unstartable: the API would not serve the bundle in runs/ and
+    so could never become ready for the first `make train-prod` to reach it.
+
+    Classified from the failure MLflow already raised rather than by asking again: an
+    unreachable registry retries with backoff, so a second question would double how
+    long a worker takes to report a refusal it is going to report anyway.
+    """
+    from mlflow.exceptions import MlflowException
+
+    # error_code is the protobuf enum, not the name the property reads back.
+    from mlflow.protos.databricks_pb2 import INTERNAL_ERROR, INVALID_PARAMETER_VALUE
+
+    from bl_ranking.serving.model_source import _alias_is_unset
+
+    answered = MlflowException("Registered model alias champion not found.",
+                               error_code=INVALID_PARAMETER_VALUE)
+    unreachable = MlflowException("API request failed", error_code=INTERNAL_ERROR)
+
+    assert _alias_is_unset(answered) is True
+    assert _alias_is_unset(unreachable) is False
+    # Anything unrecognised falls through to the refusal: a 503 an operator can explain
+    # costs less than silently serving the version they rolled back from.
+    assert _alias_is_unset(RuntimeError("something else")) is False
+
+
+def test_a_rollback_run_twice_keeps_the_way_back(tmp_path):
+    """`champion_previous` is the documented way to undo a rollback. The guard that
+    stops it pointing at the champion itself compared the caller's spelling of the
+    version, not the version the registry resolved - so `make rollback VERSION=02`
+    destroyed the only pointer back."""
+    import mlflow
+    from mlflow.tracking import MlflowClient
+
+    from bl_ranking.ops import registry
+
+    uri = f"sqlite:///{tmp_path}/mlflow.db"
+    mlflow.set_tracking_uri(uri)
+    # MLflow's active experiment is process-global, so without this the runs below are
+    # created against whichever experiment id an earlier test left behind.
+    mlflow.set_experiment("rollback_guard")
+    settings = Settings.load()
+    settings.mlflow.tracking_uri = uri
+    settings.mlflow.registered_model = "bl_rank_test"
+    settings.mlflow.serving_alias = "champion"
+
+    client = MlflowClient(tracking_uri=uri, registry_uri=uri)
+    client.create_registered_model("bl_rank_test")
+    for index in range(2):
+        with mlflow.start_run() as run:
+            pass
+        client.create_model_version("bl_rank_test", source=f"file://{tmp_path}/m{index}",
+                                    run_id=run.info.run_id)
+
+    def alias(name):
+        try:
+            # str(): MLflow returns .version as an int from some stores and a string
+            # from others, which is the very confusion the guard in set_alias exists for.
+            return str(client.get_model_version_by_alias("bl_rank_test", name).version)
+        except Exception:      # noqa: BLE001 - "not set yet" is a normal state
+            return None
+
+    registry.set_alias(settings, "1")
+    registry.set_alias(settings, "2")
+    assert (alias("champion"), alias("champion_previous")) == ("2", "1")
+
+    registry.set_alias(settings, "1")                  # rollback
+    assert (alias("champion"), alias("champion_previous")) == ("1", "2")
+    registry.set_alias(settings, "01")                 # the same rollback, padded
+    assert (alias("champion"), alias("champion_previous")) == ("1", "2")
+
+
+@pytest.mark.parametrize("body", ["[1, 2, 3]", "null", '{"payout_backend"'])
+def test_a_manifest_that_is_not_an_object_names_the_file(tmp_path, body):
+    """Tolerating a manifest from a newer pipeline is not the same as tolerating a
+    broken one. A truncated or half-written file took the worker down with "'NoneType'
+    object is not iterable", naming neither the bundle nor the file."""
+    (tmp_path / bundle_files.MANIFEST_FILE).write_text(body)
+    with pytest.raises(ValueError, match=bundle_files.MANIFEST_FILE):
+        bundle_files.Manifest.read(tmp_path)
+
+
+def test_the_registered_signature_accepts_what_the_endpoint_accepts():
+    """The signature was inferred from one example row, which made every field required
+    and the four id-ish ones `long`. Both are narrower than the HTTP contract, and each
+    broke a whole batch rather than a row: one null cellphone - an optional field -
+    demotes its column to float64 and enforcement refuses the cast, and a 17-digit
+    campaign_id cannot cross a columnar boundary as a number at all without becoming
+    ...304, which is the same float64 demotion the ingestion gate reads these columns as
+    text to avoid."""
+    import pandas as pd
+    from mlflow.models.utils import _enforce_schema
+
+    from bl_ranking.serving.pyfunc import build_signature, request_example
+
+    schema = build_signature().inputs
+    example = request_example()
+
+    _enforce_schema(example, schema)                                  # the example itself
+    _enforce_schema(pd.concat([example, example.assign(cellphone=None)],
+                              ignore_index=True), schema)             # one null optional
+    _enforce_schema(example.drop(columns=["fname", "lname", "conversion_dt"]), schema)
+
+    enforced = _enforce_schema(
+        example.assign(campaign_id="120227360861540306"), schema)
+    assert enforced["campaign_id"][0] == "120227360861540306"          # every digit
+
+
+def test_a_batch_neighbour_cannot_change_a_row(bundle, settings):
+    """The point of validating each record on its own. A null anywhere in a column makes
+    pandas type the whole column around it, so a row's features used to depend on which
+    other rows shared its batch - with no error anywhere."""
+    import pandas as pd
+    from mlflow.models.utils import _enforce_schema
+
+    from bl_ranking.serving.pyfunc import (
+        BrandRankerModel,
+        build_signature,
+        request_example,
+    )
+    from bl_ranking.serving.ranker import BrandRanker
+
+    model = BrandRankerModel()
+    model._ranker = BrandRanker.load(bundle, settings)
+    schema = build_signature().inputs
+    example = request_example().assign(campaign_id="120227360861540306")
+
+    alone = model.predict(None, _enforce_schema(example, schema))["ranking"][0]
+    neighboured = pd.concat(
+        [example.assign(cellphone=None, sub1=None), example], ignore_index=True)
+    in_batch = model.predict(None, _enforce_schema(neighboured, schema))["ranking"][1]
+
+    assert alone == in_batch

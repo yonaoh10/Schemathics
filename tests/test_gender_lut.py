@@ -169,3 +169,49 @@ def test_a_table_built_the_old_way_is_detectable(built_table, tmp_path, caplog):
         GenderLookup.load(stale_path)
     assert "predates" in caplog.text
 
+
+
+def test_an_unusable_gender_table_is_refused(tmp_path):
+    """Nothing validated this file. An empty or truncated one answers 'unknown' for
+    every name: the four bundle guards check the two models and the brand list, /readyz
+    goes green, and the ranking simply changes."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pytest
+
+    from bl_ranking.models.gender_lut import GenderLookup
+
+    empty = tmp_path / "empty.parquet"
+    pq.write_table(pa.table({"name": pa.array([], type=pa.string()),
+                             "gender": pa.array([], type=pa.string()),
+                             "confidence": pa.array([], type=pa.float64())}), empty)
+    with pytest.raises(ValueError, match="empty gender lookup"):
+        GenderLookup.load(empty)
+
+    wrong = tmp_path / "wrong.parquet"
+    pq.write_table(pa.table({"first_name": pa.array(["John"])}), wrong)
+    with pytest.raises(ValueError, match="missing column"):
+        GenderLookup.load(wrong)
+
+
+def test_a_table_built_the_old_way_reports_itself(tmp_path):
+    """A pre-fix table is indistinguishable from a good one by row count or file size,
+    and answers 'unknown' for a fifth of all names. GET /model has to say so, because
+    an operator comparing a rollback against a champion looks there and not in a log."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from bl_ranking.models.gender_lut import GenderLookup
+    from bl_ranking.serving.ranker import _gender_source
+
+    stale = tmp_path / "stale.parquet"
+    pq.write_table(pa.table({"name": pa.array(["John"]),
+                             "gender": pa.array(["male"]),
+                             "confidence": pa.array([0.99])}), stale)   # no marker
+    loaded = GenderLookup.load(stale)
+    assert loaded.key_scheme_current is False
+    assert _gender_source(loaded) == "precomputed_stale_key"
+
+    current = GenderLookup.from_mapping({"John": ("male", 0.99)})
+    assert _gender_source(current) == "precomputed"
+    assert _gender_source(None) == "names_dataset"

@@ -297,3 +297,63 @@ def test_attribution_ids_normalise_the_same_way_on_both_sides(value):
     served = RankRequest(**(dict(WARMUP_USER) | {"sub1": value})).sub1
     assert served == _as_identifier(value)
 
+
+
+@pytest.mark.parametrize(("label", "mangle"), [
+    # json.loads accepts both of these; neither can be rendered back into JSON.
+    ("not-a-number", lambda body: body.replace('"industry": "construction"',
+                                               '"industry": NaN')),
+    ("infinity", lambda body: body.replace('"industry": "construction"',
+                                           '"industry": Infinity')),
+    ("lone surrogate", lambda body: body.replace('"construction"',
+                                                 r'"const\ud800ruction"')),
+])
+def test_an_unrenderable_payload_is_a_422_not_a_500(client, example_user, label, mangle):
+    """FastAPI's own validation-error renderer echoes the offending input back, and
+    both of these break the encoder while it tries to - so a malformed payload became a
+    500 with no useful body, and nothing was counted. The surrogate case also crashed
+    CatBoost itself with a SystemError no handler recognises."""
+    import json
+
+    body = mangle(json.dumps({**example_user, "industry": "construction"}))
+    response = client.post("/rank", content=body.encode(),
+                           headers={"content-type": "application/json"})
+
+    assert response.status_code == 422, f"{label}: {response.text[:200]}"
+    detail = response.json()["detail"]
+    assert detail and all({"loc", "msg", "type"} == set(entry) for entry in detail)
+
+
+def test_a_rejected_payload_is_counted(client, example_user):
+    """An uncounted failure mode is an invisible one: a funnel sending malformed traffic
+    has to show up on the dashboard, not only in a traceback."""
+    from bl_ranking.serving.app import REQUESTS
+
+    before = REQUESTS.labels("invalid_request")._value.get()
+    client.post("/rank", json={**example_user, "session_dt": "not a timestamp"})
+    assert REQUESTS.labels("invalid_request")._value.get() == before + 1
+
+
+@pytest.mark.parametrize(("spelling", "expected"), [
+    (13055550142, 3055550142),
+    # A JSON caller has no integers. Both of these are the same payload to a browser,
+    # and str() used to render the float as '13055550142.0' - twelve digits, so the
+    # country-code strip did not fire and the prefix feature became '130' not '305'.
+    (13055550142.0, 3055550142),
+    ("13055550142", 3055550142),
+    ("(305) 555-0142", 3055550142),
+])
+def test_one_phone_number_gives_one_prefix(example_user, spelling, expected):
+    assert RankRequest.model_validate(
+        {**example_user, "cellphone": spelling}).cellphone == expected
+
+
+@pytest.mark.parametrize("spelling", [
+    120227360861540306, "120227360861540306",
+    # Going via `int(float(text))` rounds this to ...304 - the exact float64 demotion
+    # the ingestion gate exists to undo, reintroduced at the request boundary.
+    "120227360861540306.0",
+])
+def test_a_17_digit_campaign_id_stays_exact(example_user, spelling):
+    assert RankRequest.model_validate(
+        {**example_user, "campaign_id": spelling}).campaign_id == 120227360861540306

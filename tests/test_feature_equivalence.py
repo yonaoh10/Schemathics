@@ -140,3 +140,21 @@ def test_missing_register_date_is_refused_by_both(paths, example_user):
     user["register_date"] = None
     left, right = _rank_or_marker(research, user), _rank_or_marker(fast, user)
     assert left[0] == right[0] == "error"
+
+
+def test_the_two_paths_agree_on_a_span_of_years(paths, example_user):
+    """`from_start_to_register` is computed by pandas' `.dt.total_seconds()` in the
+    research code, which divides an int64 nanosecond count by 1e9 in float64.
+    datetime.timedelta.total_seconds() is exact, so past about 104 days the two answers
+    separate - 7258118399.000001 against 7258118399.0 on a span the schema accepts."""
+    import pandas as pd
+
+    from bl_ranking.serving import fast_features
+
+    session_dt, register_date = "1970-01-01 00:00:01", "2200-01-01 00:00:00"
+    row = fast_features.build_feature_row(
+        {**example_user, "session_dt": session_dt, "register_date": register_date}, None)
+
+    research = (pd.Series([pd.to_datetime(register_date)])
+                - pd.Series([pd.to_datetime(session_dt)])).dt.total_seconds().iloc[0]
+    assert row["from_start_to_register"] == research

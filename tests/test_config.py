@@ -138,3 +138,37 @@ def test_overriding_a_whole_block_with_a_scalar_names_the_mistake(monkeypatch, v
     with pytest.raises(ValueError, match="group of settings"):
         Settings.load()
 
+
+
+def _write_config(tmp_path, body, monkeypatch):
+    path = tmp_path / "probe.yaml"
+    path.write_text(body)
+    monkeypatch.setenv("BL_CONFIG", str(path))
+    return path
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    ("model:\n  payout:\n    context_size: null\n", "model.payout.context_size"),
+    ("model:\n  payout:\n    context_size: [1, 2]\n", "model.payout.context_size"),
+    ("serving:\n  threads_per_worker: 1.5\n", "serving.threads_per_worker"),
+    ("serving:\n  workers: true\n", "serving.workers"),
+    ("paths:\n  raw_dir: 12\n", "paths.raw_dir"),
+])
+def test_a_wrongly_typed_yaml_value_names_its_setting(tmp_path, monkeypatch, body, expected):
+    """The YAML parser types a value; it does not check it against the field.
+
+    Each of these used to reach Settings.validate() and surface as `'<' not supported
+    between instances of 'NoneType' and 'int'`, or - for the float - not be objected to
+    at all, and reach torch as a fractional thread count.
+    """
+    _write_config(tmp_path, body, monkeypatch)
+    with pytest.raises(ValueError, match=expected):
+        Settings.load()
+
+
+def test_a_config_file_that_is_not_yaml_names_the_file(tmp_path, monkeypatch):
+    """PyYAML's own error is a parser trace with a line number and no filename, and the
+    filename is the one thing the operator controls through BL_CONFIG."""
+    path = _write_config(tmp_path, "this: is: not: yaml:\n\tbad\n", monkeypatch)
+    with pytest.raises(ValueError, match=str(path.name)):
+        Settings.load()
