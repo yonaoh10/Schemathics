@@ -974,3 +974,57 @@ def test_the_distillation_sample_size_setting_can_lower_the_row_count(asked, at_
     assert brands == 15
     assert users >= 1, "every brand must still get at least one row"
 
+def test_a_payout_sidecar_that_disagrees_with_its_model_is_refused():
+    """Two files decide the payout half, and only their agreement makes it correct.
+
+    The sidecar list is what the backend slices the frame by, so it decides what gets
+    fed. The model's own recorded names are what it was fitted on, so they decide what
+    should have been fed. Checking only one means the guard confirms a file against
+    itself and passes while the model scores the wrong columns.
+
+    Exercised directly rather than by damaging a bundle: only the surrogate keeps a
+    sidecar, so a disk-level test skips under the offline backend CI runs - leaving the
+    check unprotected in exactly the configuration that is tested, while the summary
+    line still reads green.
+    """
+    from bl_ranking.models.payout import _fitted_feature_names
+
+    class Model:
+        def __init__(self, names):
+            self.feature_names_ = names
+
+    columns = ["a", "b", "c"]
+
+    # Agreeing sources: the persisted list is what gets sliced, so it is returned.
+    assert _fitted_feature_names(Model(list(columns)), list(columns)) == columns
+
+    # Only one source available: use whichever exists.
+    assert _fitted_feature_names(Model(None), list(columns)) == columns
+    assert _fitted_feature_names(Model(list(columns)), []) == columns
+    assert _fitted_feature_names(Model(None), []) is None
+
+    # Disagreement is a bundle assembled from two runs, whichever way it differs.
+    with pytest.raises(ValueError, match="inconsistent"):
+        _fitted_feature_names(Model(["a", "c", "b"]), columns)
+    with pytest.raises(ValueError, match="inconsistent"):
+        _fitted_feature_names(Model(["a", "b"]), columns)
+
+
+@pytest.mark.parametrize("timestamps,expected", [
+    (["2026-01-06 19:24:22"] * 3, 0),
+    (["2026-01-06 19:24:22", "06/01/2026 19:24", "2026-01-06 19:24:22"], 1),
+])
+def test_rows_needing_a_fallback_timestamp_parse_are_counted(timestamps, expected):
+    """A row whose date format differs from its column is parsed by inference.
+
+    '06/01/2026' becomes June 1st or January 6th depending on what pandas decides, and
+    session_day and session_day_of_week are model features - so a misread date is a
+    silently wrong feature rather than an error. Counted like every other repair, a
+    funnel changing its date format shows up here before it shows up in the model.
+    """
+    from bl_ranking.data.ingest import sanitise
+
+    cleaned, repairs = sanitise(_gate_frame(rows=3, session_dt=timestamps))
+    assert repairs["timestamp_format_fallbacks"] == expected
+    assert len(cleaned) == 3, "no row should be dropped for a format difference alone"
+

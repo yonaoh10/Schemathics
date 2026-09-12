@@ -144,6 +144,31 @@ class PayoutBackend(ABC):
 # Shared helpers
 # --------------------------------------------------------------------------------- #
 
+
+def _fitted_feature_names(model: Any, sidecar: list[str]) -> list[str] | None:
+    """The columns this backend will actually score, checked against the model itself.
+
+    Two files are involved and both matter. The sidecar list is what the backend slices
+    the incoming frame by, so it decides what gets fed; the model's own recorded names
+    are what it was fitted on, so they decide what should have been fed. Reading only
+    one of them means the mis-slotting check confirms a file against itself.
+
+    They must agree with each other, and the caller then checks them against the payout
+    context. A disagreement here is a bundle assembled from two different runs, which
+    is the failure the atomic bundle exists to prevent and cannot catch on its own once
+    a bundle has been written or edited inconsistently.
+    """
+    recorded = list(getattr(model, "feature_names_", None) or [])
+    persisted = list(sidecar)
+    if recorded and persisted and recorded != persisted:
+        raise ValueError(
+            f"payout model is inconsistent with its own column list: the model was "
+            f"fitted on {len(recorded)} columns and the bundle persists {len(persisted)}, "
+            f"or in a different order. Scoring would mis-slot the payout half of the "
+            f"ranking silently."
+        )
+    return persisted or recorded or None
+
 class CategoricalAdapter:
     """Ordinal-encode object columns, fitted on the context and frozen thereafter.
 
@@ -449,7 +474,7 @@ class CatBoostFallbackBackend(PayoutBackend):
         )
 
     def expected_columns(self) -> list[str] | None:
-        return list(self._columns) or None
+        return _fitted_feature_names(self._model, self._columns)
 
     def _cat_indices(self, columns: list[str]) -> list[int]:
         return [columns.index(c) for c in self._cat_columns]
@@ -620,7 +645,7 @@ class SurrogateBackend(PayoutBackend):
         return np.asarray(self._student.predict(batch.pool(indices)), dtype=float)
 
     def expected_columns(self) -> list[str] | None:
-        return list(self._columns) or None
+        return _fitted_feature_names(self._student, self._columns)
 
     def save_extra(self, directory: Path) -> list[str]:
         target = directory / self.STUDENT_FILE

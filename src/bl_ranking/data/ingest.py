@@ -186,9 +186,20 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
 
     # Timestamps are normalised to ISO strings so the Delta round trip reproduces
     # exactly what pd.read_csv would have handed the research code.
+    timestamp_fallbacks = 0
     for col in ("session_dt", "conversion_dt", "register_date"):
-        parsed = _to_utc_naive(frame[col])
+        parsed, fallback_rows = _to_utc_naive(frame[col])
+        # A row the first pass could not read and the second could is a row whose
+        # format differs from the rest of its column, and pandas then infers the
+        # layout: '06/01/2026' becomes June 1st or January 6th depending on what it
+        # decides. session_day and session_day_of_week are model features, so a
+        # misread date is a silently wrong feature rather than an error. Counted like
+        # every other repair, so a funnel changing its date format shows up here
+        # before it shows up in the model.
+        timestamp_fallbacks += fallback_rows
         frame[col] = parsed.dt.strftime("%Y-%m-%d %H:%M:%S").where(parsed.notna(), None)
+
+    repairs["timestamp_format_fallbacks"] = timestamp_fallbacks
 
     # A row with no session timestamp cannot be placed on the train/test timeline.
     before = len(frame)
@@ -204,7 +215,7 @@ INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 
 
 def _to_utc_naive(values: pd.Series) -> pd.Series:
-    """Parse timestamps to naive UTC, whatever mixture of offsets the column holds.
+    """Parse timestamps to naive UTC, returning the series and the fallback-row count.
 
     Two passes, because neither alone is correct. Without `utc=True`, a column mixing
     '...+00:00' with '...-05:00' - which is what a DST transition looks like in an
@@ -219,12 +230,14 @@ def _to_utc_naive(values: pd.Series) -> pd.Series:
     """
     aware = pd.to_datetime(values, errors="coerce", utc=True)
     missed = aware.isna() & values.notna()
+    fallback = 0
     if missed.any():
         retry = pd.to_datetime(values[missed], errors="coerce")
         if getattr(retry.dtype, "tz", None) is None:
             retry = retry.dt.tz_localize("UTC")
         aware = aware.where(~missed, retry)
-    return aware.dt.tz_convert("UTC").dt.tz_localize(None)
+        fallback = int((aware.notna() & missed).sum())
+    return aware.dt.tz_convert("UTC").dt.tz_localize(None), fallback
 
 def _as_int64(value: object) -> int | None:
     """Parse an id to an exact int64, or None if it cannot be one.
