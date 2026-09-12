@@ -273,8 +273,12 @@ def run_sweep_point(url: str, payloads: list[bytes], target_rps: float, duration
     if processes == 1:
         outcomes = [_run_one_process(jobs[0])]
     else:
-        from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=processes) as pool:
+        # multiprocessing.Pool rather than ProcessPoolExecutor, because its workers are
+        # daemonic: interrupt the sweep and they go with it. Executor children are not, and
+        # a Ctrl-C left three orphaned generators firing at the server for nine minutes -
+        # which then showed up as unexplained load in the next measurement.
+        import multiprocessing as mp
+        with mp.get_context("spawn").Pool(processes=processes) as pool:
             outcomes = list(pool.map(_run_one_process, jobs))
 
     for samples, errors, in_flight, offered, span in outcomes:
