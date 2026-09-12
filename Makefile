@@ -76,9 +76,21 @@ serve:
 
 # Sweep rather than a single rate: the point at which achieved rps falls behind the
 # target is the capacity number, and a single point cannot show it.
+# GENERATORS, not workers: one asyncio process cannot schedule much past ~200 arrivals per
+# second while sharing four cores with the server, and when it falls behind it charges its
+# own lateness to the server - which is how this harness once reported 54 s p50 for an
+# endpoint answering in 8 ms. Three generators offer the whole sweep with a send lag in the
+# low milliseconds. Override with `make loadtest GENERATORS=1` to see the difference.
+GENERATORS ?= 3
+
+# 30 s rather than 20: the published numbers used to move by 2x with the duration, because
+# a saturated generator's backlog never reaches steady state and every percentile grew with
+# however long the run was left going. With the generator keeping up they converge, and 30 s
+# is long enough to show that they have.
 loadtest:
 	$(PYTHON) loadtest/run_load.py --url http://127.0.0.1:$(PORT)/rank \
-	  --rps 25,50,100,200,300,400 --duration 20 --warmup 5 \
+	  --rps 25,50,100,200,300,400 --duration 30 --warmup 5 \
+	  --processes $(GENERATORS) \
 	  --out loadtest/results/latency.json
 
 schedule:
