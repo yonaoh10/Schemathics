@@ -62,8 +62,17 @@ def write_snapshot(frame: pd.DataFrame, table_uri: str | Path,
 
 
 def commit_metadata(table_uri: str | Path, version: int, key: str) -> str | None:
-    """One custom metadata value from the commit that produced `version`."""
-    for entry in DeltaTable(str(resolve(table_uri))).history():
+    """One custom metadata value from the commit that produced `version`.
+
+    None for anything that means "not there": no such table, no such version, no such
+    key. The only caller logs it as run parameters, and a missing counter must never be
+    the reason a finished training run fails.
+    """
+    try:
+        history = DeltaTable(str(resolve(table_uri))).history()
+    except Exception:  # noqa: BLE001 - an unreadable table simply has no metadata to give
+        return None
+    for entry in history:
         if entry.get("version") == version:
             value = entry.get(key)
             return str(value) if value is not None else None
