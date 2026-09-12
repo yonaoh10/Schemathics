@@ -282,3 +282,18 @@ def test_a_timestamp_pair_that_cannot_be_subtracted_is_refused(client):
     body = dict(WARMUP_USER) | {"session_dt": "1700-01-01 00:00:00"}
     assert client.post("/rank", json=body).status_code == 422
 
+@pytest.mark.parametrize("value", [7448788, "7448788", "7448788.0", 7448788.0, "007448788", None])
+def test_attribution_ids_normalise_the_same_way_on_both_sides(value):
+    """sub1/sub2/sub3 are categorical, so the level is whatever string is produced.
+
+    The ingestion gate normalises them so '1815195.0' and '1815195' are one id.
+    Nothing did the same at the request boundary, so a caller quoting an id with a
+    trailing '.0' - exactly what a JSON encoder emits for a float-typed column
+    upstream - scored against a level training had never seen. The rule is imported
+    from the gate rather than restated, because two copies are two chances to drift.
+    """
+    from bl_ranking.data.ingest import _as_identifier
+
+    served = RankRequest(**(dict(WARMUP_USER) | {"sub1": value})).sub1
+    assert served == _as_identifier(value)
+

@@ -112,6 +112,28 @@ class RankRequest(BaseModel):
             return None
         return _normalise_timestamp(value, required=False)
 
+    @field_validator("sub1", "sub2", "sub3", mode="before")
+    @classmethod
+    def normalise_attribution_id(cls, value: Any) -> Any:
+        """Apply the rule the ingestion gate applies, so both sides agree on the level.
+
+        sub1/sub2/sub3 are categorical features, and the level is whatever string the
+        research code's `.astype(str)` produces. data/ingest normalises them so that
+        '1815195.0' and '1815195' are the same id; nothing did the same at the request
+        boundary, so a caller quoting an id with a trailing '.0' - which is exactly
+        what a JSON encoder produces for a float-typed column upstream - scored against
+        a level training had never seen.
+
+        Imported from the gate rather than restated here: two copies of a
+        normalisation rule are two chances for the sides to drift apart again, which
+        is the whole shape of this bug.
+        """
+        from bl_ranking.data.ingest import _as_identifier
+
+        if value is None:
+            return None
+        return _as_identifier(value)
+
     @field_validator("campaign_id", mode="before")
     @classmethod
     def normalise_campaign_id(cls, value: Any) -> int:
