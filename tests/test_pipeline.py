@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC
 from pathlib import Path
 
@@ -1900,3 +1901,41 @@ def test_the_weekly_job_runs_the_three_steps_it_documents():
     assert source.index("ingest()") < source.index("train_test=False")
     assert source.index("train_test=False") < source.index("train_test=True")
     assert "return" in source.split("train_test=False", 1)[1].split("train_test=True", 1)[0]
+
+
+def test_the_training_path_finds_a_pre_placed_tabpfn_checkpoint(monkeypatch, tmp_path):
+    """The offline flow the README documents has to work where TabPFN actually runs.
+
+    Only scripts/serve.sh set TABPFN_MODEL_CACHE_DIR, and serving never constructs a TabPFN
+    at all - it scores the distilled surrogate. Training, which does, set nothing: on a box
+    with the checkpoint already pre-placed exactly as documented, `make train-prod
+    BACKEND=tabpfn_local` still went to huggingface.co and died on a proxy error two minutes
+    in. The variables have to be set by the code, so make, the scheduler, Docker and
+    Databricks all behave the same way.
+    """
+    from bl_ranking.models import payout
+
+    for key in ("TABPFN_MODEL_CACHE_DIR", "TABPFN_DISABLE_TELEMETRY", "TABPFN_CLIENT_CI_MODE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(payout, "TABPFN_CACHE_DIR", tmp_path)
+
+    # Nothing pre-placed: the library must be left to say "could not download", which is
+    # the truth, rather than be pointed at an empty directory and say "not in cache".
+    payout.prepare_tabpfn_environment()
+    assert "TABPFN_MODEL_CACHE_DIR" not in os.environ
+    assert os.environ["TABPFN_DISABLE_TELEMETRY"] == "1"
+
+    (tmp_path / payout.TABPFN_CHECKPOINT).write_bytes(b"not a real checkpoint")
+    payout.prepare_tabpfn_environment()
+    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == str(tmp_path)
+
+
+def test_an_operators_own_tabpfn_cache_is_not_overridden(monkeypatch, tmp_path):
+    """Somebody who has set the variable has a reason; a default must not replace it."""
+    from bl_ranking.models import payout
+
+    monkeypatch.setattr(payout, "TABPFN_CACHE_DIR", tmp_path)
+    (tmp_path / payout.TABPFN_CHECKPOINT).write_bytes(b"not a real checkpoint")
+    monkeypatch.setenv("TABPFN_MODEL_CACHE_DIR", "/somewhere/else")
+    payout.prepare_tabpfn_environment()
+    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == "/somewhere/else"

@@ -85,11 +85,14 @@ GENERATORS ?= 3
 
 # 30 s rather than 20: the published numbers used to move by 2x with the duration, because
 # a saturated generator's backlog never reaches steady state and every percentile grew with
-# however long the run was left going. With the generator keeping up they converge, and 30 s
-# is long enough to show that they have.
+# however long the run was left going. Long enough matters at the top of the sweep in the
+# other direction too - a 20 s run read 400 rps as comfortable and three 30 s runs could not
+# offer that rate at all. Even at 30 s, run the sweep more than once: 300 rps came back at
+# p99 48, 54 and 750 ms on three identical runs, so a single sweep can only mislead. See
+# docs/load-test.md, which publishes medians of three with the spread.
 loadtest:
 	$(PYTHON) loadtest/run_load.py --url http://127.0.0.1:$(PORT)/rank \
-	  --rps 25,50,100,200,300,400 --duration 30 --warmup 5 \
+	  --rps 25,50,100,200,300,350,400 --duration 30 --warmup 5 \
 	  --processes $(GENERATORS) \
 	  --out loadtest/results/latency.json
 

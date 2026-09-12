@@ -41,7 +41,10 @@ make train-prod BACKEND=tabpfn_client    # exact, hosted; needs TABPFN_TOKEN
 ```
 
 `pip install -e '.[tabpfn]'` pulls torch. The weights are fetched on first use; to run
-fully offline, pre-place `tabpfn-v2-regressor.ckpt` in `TABPFN_MODEL_CACHE_DIR`.
+fully offline, drop `tabpfn-v2-regressor.ckpt` into `.tabpfn_models/` and every entry point
+finds it — `TABPFN_MODEL_CACHE_DIR` is set from there by the code that constructs the model,
+not by one shell script, so `make`, the scheduler, Docker and the Databricks job all behave
+the same. Setting the variable yourself still wins.
 
 The whole stack in Docker, which is the closest local analogue of the Databricks
 deployment:
@@ -71,16 +74,20 @@ curl -s localhost:8080/rank -H 'content-type: application/json' -d '{
 ```json
 {
   "ranking": {
-    "sba central":     {"rank": 1.0, "expected_payout": 57.53},
-    "forward funding": {"rank": 2.0, "expected_payout": 57.39},
-    "fora financial":  {"rank": 3.0, "expected_payout": 52.68}
+    "sba central":     {"rank": 1.0, "expected_payout": 18.78},
+    "smb compass":     {"rank": 2.0, "expected_payout": 14.76},
+    "forward funding": {"rank": 3.0, "expected_payout": 14.71}
   },
   "meta": {
-    "model_version": "fe0373d4f372...", "payout_backend": "surrogate",
-    "payout_exact": false, "brands_ranked": 15, "latency_ms": 1.9
+    "model_version": "d1b0064bfaed...", "payout_backend": "surrogate",
+    "payout_exact": false, "brands_ranked": 15, "latency_ms": 3.7
   }
 }
 ```
+
+Truncated to the top three of fifteen. The payouts are this model's, not the contract's:
+`meta.model_version` is in every response precisely because the numbers move with the
+version, and re-running the example after a retrain is expected to produce different ones.
 
 `ranking` is exactly what the research function returns. `meta` says which model
 version produced it and whether that backend is bit-identical to TabPFN.
@@ -468,19 +475,23 @@ classifier), models already warm, one request being one user scored against 15 b
 
 | path | p50 | p95 | p99 |
 |---|---|---|---|
-| the research pipeline as written | 60.3 ms | 74.4 ms | 83.6 ms |
-| what this system serves | **2.41 ms** | 2.68 ms | 3.61 ms |
+| the research pipeline as written | 53.7 ms | 57.3 ms | 59.4 ms |
+| what this system serves | **2.81 ms** | 3.04 ms | 3.48 ms |
 
-25x, and every step of it exact-preserving. Where the 2.41 ms goes:
+19x, and every step of it exact-preserving. Where the 2.8 ms goes — reproduce any of this
+with `python scripts/profile_request.py`:
 
 | stage | p50 |
 |---|---|
-| build the user's 24 features | 0.013 ms |
-| broadcast them across 15 brands | 0.014 ms |
-| build one CatBoost `Pool` | 0.33 ms |
-| classifier `predict_proba` | 0.97 ms |
-| payout `predict` | 0.79 ms |
-| sort, rank, serialise | 0.02 ms |
+| build the user's 24 features | 0.063 ms |
+| broadcast them across 15 brands | 0.030 ms |
+| build one CatBoost `Pool` | 0.365 ms |
+| classifier `predict_proba` | 1.319 ms |
+| payout `predict` | 0.910 ms |
+| sort, rank, serialise | 0.069 ms |
+
+Two thirds of it is the two model calls, which is the right shape: there is no pandas
+overhead left to remove.
 
 Three changes got it there, in order of what they were worth:
 
@@ -490,7 +501,7 @@ Three changes got it there, in order of what they were worth:
    (0.6 ms each), `Series.apply(lambda: pd.Series(...))` for the gender feature (1.3 ms),
    and about twenty `.loc[mask, col] = value` assignments across the four band mappings
    (0.33 ms each). That cost is per *operation*, not per row, so it does not shrink with
-   the data. Feature construction is now 0.013 ms.
+   the data. Feature construction is now 0.063 ms.
 2. **Everything request-independent moved to start-up** — the CatBoost load, the payout
    context fit, the brand universe, the warning handler. The research predictor does all
    of it inside `predict_()`, on every request.
@@ -507,18 +518,24 @@ research` switches back to the original at runtime.
 
 ### Cold start
 
-`nd = NameDataset()` at module import in both research scripts costs **18.6 s and
-2.4 GB resident**. Three worker processes would need 7 GB and 18 s each before serving
-a single request.
+`nd = NameDataset()` at module import in both research scripts costs **10.8 s and 2.3 GB
+resident**. Three worker processes would need 6.8 GB, and each would pay the 10.8 s before
+serving a single request.
 
 `detect_gender_with_confidence` is a pure function of one first name, and the dataset's
-first-name universe is finite (727,556 entries), so the training job materialises the
-whole function into a table that ships inside the model bundle:
+first-name universe is finite (727,556 entries, which collapse to 714,191 distinct
+capitalised lookup keys), so the training job materialises the whole function into a table
+that ships inside the model bundle:
 
-| | import cost | resident | per lookup |
+| | load cost | resident | per lookup |
 |---|---|---|---|
-| `NameDataset()` | 18.6 s | 2.4 GB | 77 µs |
-| precomputed table | 3.9 s | 290 MB | 0.09 µs |
+| `NameDataset()` | 10.8 s | 2,261 MB | 70.5 µs |
+| precomputed table | 3.6 s | 349 MB | 0.235 µs |
+
+Both columns measured on the same box in the same session, rotating nine first names
+including a hyphenated one and one the dataset does not know. 300× cheaper per lookup is
+the part that matters on the request path; 6.5× less resident memory per worker is the part
+that decides how many workers fit.
 
 The table is keyed by what the serving path actually looks up. The research code does
 `str(x).strip().capitalize()` before the lookup, and `capitalize()` lowercases
@@ -573,13 +590,20 @@ queueing, and it is the first thing to look at when p99 leaves p50 behind. Perce
 are nearest-rank, so every number printed is a real observation.
 
 ```bash
-make loadtest        # sweeps 25 -> 400 rps
+make loadtest        # sweeps 25 -> 400 rps with 3 generator processes
 ```
 
-Results and the capacity reading are in [`docs/load-test.md`](docs/load-test.md).
+Over three identical sweeps, the service is flat to **250 rps** — p50 between 9.7 and
+11.5 ms, p99 under 50 ms, nothing erroring — and 300 rps is the edge: two sweeps and a
+60-second hold put it at p50 14–18 ms, a third at p50 41 ms and p99 750 ms. Full tables,
+the spread and the capacity reading are in [`docs/load-test.md`](docs/load-test.md).
 
-Caveat stated plainly: on a 4-core box the generator competes with the server. The
-number worth trusting is the rate at which *achieved* rps falls behind *target*.
+Caveat stated plainly: on a 4-core box the generator competes with the server, so 250 rps
+per three-worker box is a floor rather than a ceiling. It is also why the harness measures
+*itself* first — send lag, in-flight count and error share are on every row, and a row that
+fails any of those checks is reported as the generator's problem instead of as latency. Both
+earlier readings of this section were single runs, and both were wrong in opposite
+directions; the number that survived repetition is the modest one.
 
 ---
 

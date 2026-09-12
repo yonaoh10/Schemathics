@@ -9,6 +9,7 @@ traffic, so no server is needed.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,7 +17,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "loadtest"))
 
-from run_load import Result, Sample, _percentiles, _target_rates, load_payloads  # noqa: E402
+from run_load import (  # noqa: E402
+    Result,
+    Sample,
+    _percentiles,
+    _target_rates,
+    load_payloads,
+    render,
+)
 
 
 def _sample(due: float, sent: float, finished: float, status: int = 200,
@@ -117,3 +125,40 @@ def test_the_built_in_payloads_are_distinct_users():
     payloads = load_payloads(None, count=50)
     assert len(payloads) == 50
     assert len(set(payloads)) == 50
+
+
+def test_every_built_in_payload_is_one_the_endpoint_accepts():
+    """The generator drew session_dt and register_date on independent days, so half its
+    payloads had the survey submitted before the session that showed it - which the schema
+    refuses, correctly. The sweep then measured a service answering 422s at half the offered
+    rate and printed it as capacity, with clean percentiles of the refusals.
+
+    Validated through the request model itself rather than by re-checking the date
+    arithmetic here, so any rule the endpoint adds later is enforced on this workload too.
+    """
+    from bl_ranking.serving.schemas import RankRequest
+
+    for payload in load_payloads(None, count=100):
+        RankRequest(**json.loads(payload))
+
+
+def test_a_run_that_mostly_errors_is_not_reported_as_latency():
+    """The row said "ok" while half the traffic was a 422. Percentiles of refusals look
+    excellent, so the verdict column has to say what happened instead."""
+    def summary(ok, errors):
+        return {"target_rps": 100, "achieved_rps": 50.0, "ok": ok, "errors": errors,
+                "service_ms": {"p50": 1.0, "p99": 2.0, "max": 3.0},
+                "send_lag_ms": {"p50": 0.1, "p99": 0.2},
+                "client_ms": {"p50": 1.1, "p99": 2.2},
+                "server_ms": {"p50": 0.9, "p99": 1.8},
+                "generator_saturated": False, "saturation_reasons": [],
+                "offered": ok + errors, "max_in_flight": 4, "processes": 3}
+
+    mostly_errors = render([summary(ok=500, errors=500)])
+    assert "50% NOT 2xx" in mostly_errors
+    assert "not a latency measurement" in mostly_errors
+
+    # One reset in a thousand is not a story, and must not bury the real verdict.
+    healthy = render([summary(ok=1000, errors=1)])
+    assert "NOT 2xx" not in healthy
+    assert "  ok" in healthy

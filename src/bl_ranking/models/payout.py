@@ -51,7 +51,36 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from bl_ranking.config import PayoutSettings
+from bl_ranking.config import REPO_ROOT, PayoutSettings
+
+# Where a pre-placed TabPFN checkpoint lives, and the name the library looks for. Training
+# is the only process that runs TabPFN - serving scores the distilled surrogate - so this
+# is where the offline story has to hold.
+TABPFN_CACHE_DIR = REPO_ROOT / ".tabpfn_models"
+TABPFN_CHECKPOINT = "tabpfn-v2-regressor.ckpt"
+
+
+def prepare_tabpfn_environment() -> None:
+    """Point TabPFN at a local checkpoint and stop it phoning home.
+
+    scripts/serve.sh set these three variables and the training path set none of them,
+    which is exactly backwards: the surrogate's teacher runs in the weekly job, and serving
+    never constructs a TabPFN at all. So `make train-prod BACKEND=tabpfn_local` on a box
+    with the checkpoint already in `.tabpfn_models` - the layout the README tells you to
+    create for an offline run - still tried to fetch it from huggingface.co and failed with
+    a proxy error naming a URL, two minutes into the job.
+
+    `setdefault`, so an operator who has set any of these keeps their value. The cache
+    directory is only defaulted when the checkpoint is actually there: pointing the library
+    at an empty directory would replace a clear "could not download" with a confusing
+    "not found in cache".
+    """
+    if (TABPFN_CACHE_DIR / TABPFN_CHECKPOINT).exists():
+        os.environ.setdefault("TABPFN_MODEL_CACHE_DIR", str(TABPFN_CACHE_DIR))
+    # Telemetry on a training box is a proxy error per fit at best; the hosted client's
+    # progress spinner busy-polls on a 200 ms grid.
+    os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("TABPFN_CLIENT_CI_MODE", "true")
 
 # Columns the research code hands the payout model are a mix of numeric and free text.
 # CatBoost takes them natively; TabPFN needs them ordinal-encoded, which the
@@ -261,6 +290,7 @@ class TabPFNLocalBackend(PayoutBackend):
         self._adapter = CategoricalAdapter()
 
     def _build(self) -> Any:
+        prepare_tabpfn_environment()      # before the import: the library reads it at load
         from tabpfn import TabPFNRegressor  # lazy: importing torch costs ~3.7 s
 
         device = self.cfg.device
@@ -366,6 +396,7 @@ class TabPFNClientBackend(PayoutBackend):
         self.model_id: str | None = None
 
     def _authenticate(self) -> None:
+        prepare_tabpfn_environment()
         from tabpfn_client import set_access_token
 
         token = os.environ.get("TABPFN_TOKEN")
@@ -373,8 +404,6 @@ class TabPFNClientBackend(PayoutBackend):
             raise RuntimeError(
                 "TABPFN_TOKEN is not set; backend 'tabpfn_client' cannot authenticate."
             )
-        # Removes the client's 200 ms polling grid. Must be set before the first call.
-        os.environ.setdefault("TABPFN_CLIENT_CI_MODE", "true")
         set_access_token(token)
 
     def _construct(self) -> Any:

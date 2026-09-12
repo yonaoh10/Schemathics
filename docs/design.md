@@ -259,12 +259,12 @@ images.
 ## 6. How it runs in production
 
 **Sizing.** The training job peaks around 9.5 GB resident on the full two-month window:
-2.4 GB of it is the names-dataset import, the rest is the 81k-row frame and the
+2.3 GB of it is the names-dataset import, the rest is the 81k-row frame and the
 teacher-labelled distillation sample. That is what the cluster node type in
 `databricks.yml` is sized for. Serving is a different shape entirely: 866 MB resident per
 worker measured warm, 688 MB of it private, so the documented three workers cost 2.1 GB
 together. The gender table replaced the names library, which is what keeps a worker under a
-gigabyte at all — the library alone was 2.4 GB.
+gigabyte at all — the library alone is 2.3 GB, and the table that replaced it is 349 MB.
 
 **Weekly, Sunday 05:00.** A Databricks job with three tasks: ingest the extract into a
 Delta table, fit and register a version, then run the evaluation mode for the researcher
@@ -358,7 +358,7 @@ Spearman against the default is below 1.0 — and brand order is the output that
 Rejected as a silent knob; it stays configurable and documented.
 
 **Keep `names-dataset` and share it across workers with a preloading fork.** Would cut
-the 2.4 GB from N copies to roughly one. Rejected: it is a workaround for a cost that can
+the 2.3 GB from N copies to roughly one. Rejected: it is a workaround for a cost that can
 be removed entirely. Materialising the gender function into a 4 MB table makes the
 serving image not need the library at all, and it is exact because the name universe is
 finite and each entry is built by asking the research function itself.

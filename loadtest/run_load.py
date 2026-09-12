@@ -67,6 +67,11 @@ from pathlib import Path
 
 import httpx
 
+# Above this share of non-2xx responses the row is reported as an error rate rather than as
+# latency. 1% is well above an occasional connection reset and well below "the endpoint is
+# refusing this workload", which is the case worth shouting about.
+ERROR_SHARE_LIMIT = 0.01
+
 
 @dataclass
 class Sample:
@@ -364,8 +369,14 @@ def load_payloads(path: Path | None, count: int) -> list[bytes]:
         user["credit_score"] = rng.choice(credits)
         user["monthly_revenue"] = rng.choice(revenues)
         user["loan_amount"] = rng.choice(amounts)
-        user["session_dt"] = f"2026-01-{rng.randint(1, 28):02d} {rng.randint(0, 23):02d}:15:00"
-        user["register_date"] = f"2026-01-{rng.randint(1, 28):02d} {rng.randint(0, 23):02d}:17:30"
+        # register_date is derived from session_dt, not drawn independently. Drawing both
+        # put the survey before the session in half the payloads - which the schema
+        # correctly refuses, because `from_start_to_register` would be negative and no
+        # training row looks like that. The run then measured a service answering 422s at
+        # half the offered rate and reported it as capacity.
+        day, hour = rng.randint(1, 28), rng.randint(0, 23)
+        user["session_dt"] = f"2026-01-{day:02d} {hour:02d}:15:00"
+        user["register_date"] = f"2026-01-{day:02d} {hour:02d}:17:30"
         user["cellphone"] = 2010000000 + i
         payloads.append(json.dumps(user).encode())
     return payloads
@@ -386,8 +397,17 @@ def render(summaries: list[dict]) -> str:
             lines.append(f"{s['target_rps']:>7.0f} {'-':>7} {s['ok']:>7} {s['errors']:>4}"
                          f"   no successful responses")
             continue
-        verdict = ("GENERATOR " + "+".join(s["saturation_reasons"]).upper()
-                   if s["generator_saturated"] else "ok")
+        # An error rate worth noticing outranks everything else in this column. A run whose
+        # payloads the endpoint refuses still produces clean-looking percentiles - of the
+        # refusals - and the row said "ok" while half the traffic was a 422, which is how a
+        # service answering nothing useful got reported as its own capacity.
+        share = s["errors"] / max(1, s["ok"] + s["errors"])
+        if share > ERROR_SHARE_LIMIT:
+            verdict = f"{share:.0%} NOT 2xx"
+        elif s["generator_saturated"]:
+            verdict = "GENERATOR " + "+".join(s["saturation_reasons"]).upper()
+        else:
+            verdict = "ok"
         lines.append(
             f"{s['target_rps']:>7.0f} {s['achieved_rps']:>7.1f} {s['ok']:>7} "
             f"{s['errors']:>4} {service['p50']:>8.2f} {service['p99']:>8.2f} "
@@ -408,6 +428,15 @@ def render(summaries: list[dict]) -> str:
                 f"handler header p50 {s['server_ms']['p50']:.2f} p99 "
                 f"{s['server_ms']['p99']:.2f}"
             )
+    if any(s["errors"] / max(1, s["ok"] + s["errors"]) > ERROR_SHARE_LIMIT
+           for s in summaries):
+        lines += [
+            "",
+            "A row marked ... NOT 2xx is not a latency measurement. The percentiles on it",
+            "are the percentiles of whatever the endpoint returned instead - most cheaply, a",
+            "422 - so the service looks fast and idle while it serves nobody. Fix the",
+            "payloads (POST one by hand and read the body) before reading anything else.",
+        ]
     if any(s["generator_saturated"] for s in summaries):
         lines += [
             "",
@@ -454,7 +483,13 @@ def main() -> None:
                         help="comma-separated target rates to sweep")
     parser.add_argument("--duration", type=float, default=20.0)
     parser.add_argument("--warmup", type=float, default=4.0)
-    parser.add_argument("--connections", type=int, default=128,
+    # 128 was not enough, and the way it failed was the expensive kind: at a 400 rps
+    # target the pool ran out, requests queued inside the client, the queue compounded
+    # (2,364 in flight against 384 sockets) and the row read svc p50 1.6 s / p99 18 s -
+    # the service, on the same box in the next minute with 384 connections, was 45 ms and
+    # 300 ms. An idle keep-alive socket costs almost nothing; a misattributed 18 seconds
+    # costs a capacity decision.
+    parser.add_argument("--connections", type=int, default=384,
                         help="keep-alive connections PER generator process. Enough that "
                              "requests never wait for one: that wait is inside the measured "
                              "service time and reads as the server being slow")
