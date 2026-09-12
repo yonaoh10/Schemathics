@@ -28,13 +28,23 @@ serving image never needs names-dataset at all.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+log = logging.getLogger("bl_ranking.models")
+
 ARTIFACT_NAME = "gender_lookup.parquet"
+
+# Stamped into the parquet's own metadata so a stale table announces itself. Bump this
+# whenever the KEY changes: a table keyed the old way looks perfectly healthy from the
+# outside - right row count, right columns - and answers 'unknown' for a fifth of all
+# names. Only a rebuild fixes it, and only this marker makes the need visible.
+KEY_SCHEME = b"capitalised-lookup-key-v1"
+KEY_SCHEME_FIELD = b"bl_key_scheme"
 
 # What the research code returns when the dataset has no usable entry for a name.
 UNKNOWN: tuple[str, float] = ("unknown", 0.0)
@@ -74,6 +84,7 @@ class GenderLookup:
     @classmethod
     def load(cls, path: str | Path) -> GenderLookup:
         table = pq.read_table(path)
+        _warn_if_stale(table, path)
         names = table.column("name").to_pylist()
         genders = table.column("gender").to_pylist()
         confidences = table.column("confidence").to_pylist()
@@ -127,6 +138,7 @@ class GenderLookup:
                 # has to be exact.
                 "confidence": pa.array(confidences, type=pa.float64()),
             })
+            table = table.replace_schema_metadata({KEY_SCHEME_FIELD: KEY_SCHEME})
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(table, str(path), compression="zstd")
 
@@ -192,3 +204,26 @@ class _LiveGenderLookup(GenderLookup):
 
     def lookup(self, fname: str) -> tuple[str, float]:
         return _detect(self._dataset, fname)
+
+
+def _warn_if_stale(table, path) -> None:
+    """Say so when a table was built before the lookup key was fixed.
+
+    A table keyed on the dataset's own spelling is indistinguishable from a correct one
+    by inspection: same row count, same columns, same file size. It simply answers
+    'unknown' for every name whose capitalisation differs from its own - 141,897 of
+    727,556, every hyphenated and multi-word first name among them - while the research
+    path answers correctly, so the two feature implementations disagree silently.
+
+    Warned rather than refused: an old bundle still serves, and refusing to load one
+    would turn a degraded feature into an outage. The next training run rebuilds it.
+    """
+    metadata = table.schema.metadata or {}
+    if metadata.get(KEY_SCHEME_FIELD) == KEY_SCHEME:
+        return
+    log.warning(
+        "%s predates the lookup-key fix (no %s marker). Roughly a fifth of first names "
+        "will resolve to 'unknown' on the vectorised path while the research path "
+        "resolves them correctly. Retrain to rebuild the table.",
+        path, KEY_SCHEME_FIELD.decode(),
+    )

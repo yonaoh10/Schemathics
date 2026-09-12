@@ -137,3 +137,35 @@ def test_table_is_small_enough_to_ship_in_a_model_bundle(built_table):
     _, path = built_table
     size_mb = path.stat().st_size / 1e6
     assert size_mb < 15, f"{size_mb:.1f} MB - the whole point is that it is small"
+
+def test_a_table_built_the_old_way_is_detectable(built_table, tmp_path, caplog):
+    """A stale table looks perfectly healthy: same rows, same columns, same size.
+
+    It simply answers 'unknown' for every name whose capitalisation differs from its
+    own, so the two feature paths disagree with nothing to show for it. The parquet
+    therefore carries a key-scheme marker, and an unmarked one says so on load.
+    """
+    import logging
+
+    import pyarrow.parquet as pq
+
+    from bl_ranking.models.gender_lut import KEY_SCHEME, KEY_SCHEME_FIELD, GenderLookup
+
+    _, path = built_table
+
+    # A freshly built table carries the marker and loads quietly.
+    assert (pq.read_table(path).schema.metadata or {}).get(KEY_SCHEME_FIELD) == KEY_SCHEME
+    with caplog.at_level(logging.WARNING):
+        GenderLookup.load(path)
+    assert "predates" not in caplog.text
+
+    # Strip the marker, as every table written before the fix lacks it.
+    stale = pq.read_table(path).replace_schema_metadata({})
+    stale_path = tmp_path / "stale.parquet"
+    pq.write_table(stale, str(stale_path))
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        GenderLookup.load(stale_path)
+    assert "predates" in caplog.text
+

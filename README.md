@@ -435,17 +435,23 @@ The table is keyed by what the serving path actually looks up. The research code
 `str(x).strip().capitalize()` before the lookup, and `capitalize()` lowercases
 everything after the first letter, so "Anne-Marie" is asked for as "Anne-marie".
 names-dataset normalises internally and still finds it; a table keyed on the dataset's
-own spelling did not. 102,602 of the 727,556 names — every hyphenated and multi-word
+own spelling did not. 141,897 of the 727,556 names — every hyphenated and multi-word
 first name among them — differ from their own capitalisation, and each one silently
 returned `unknown`. Building each entry by asking the research function with the
 capitalised key makes the table exact, because that is the same question serving asks.
+
+A table built before this fix is indistinguishable from a correct one by inspection -
+same row count, same columns, same size - so the parquet now carries a key-scheme
+marker and loading an older one logs a warning naming what is wrong and that a retrain
+rebuilds it. It warns rather than refuses: an old bundle still serves, and turning a
+degraded feature into an outage would be the worse trade.
 
 Names the table does not contain return `('unknown', 0.0)`, which is what the research
 implementation returns for a name the dataset does not know.
 `tests/test_gender_lut.py` checks both, through the serving key, and deliberately
 samples the names that differ under capitalisation — the earlier version compared raw
 dataset spellings on both sides, so it exercised a path production never takes and
-stayed green while 14% of the dataset missed.
+stayed green while a fifth of the dataset missed.
 
 The serving image therefore does not install `names-dataset` at all, and the research
 predictor module is imported lazily so a default serving process never touches it.
