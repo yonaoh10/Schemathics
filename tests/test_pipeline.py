@@ -1387,3 +1387,23 @@ def test_a_batch_neighbour_cannot_change_a_row(bundle, settings):
     in_batch = model.predict(None, _enforce_schema(neighboured, schema))["ranking"][1]
 
     assert alone == in_batch
+
+
+def test_a_numeric_timestamp_column_is_refused():
+    """pandas reads a number in a date column as nanoseconds since 1970, so a funnel
+    switching to a YYYYMMDD integer date turns every row into 1970-01-01 - one value for
+    the whole column, no row dropped, no repair counted. session_day and
+    session_day_of_week are model features, so that is a silently constant feature rather
+    than an error. 20260115 as a date and 20260115 as a nanosecond count cannot be told
+    apart from inside the gate, so it says so instead of choosing."""
+    import numpy as np
+
+    from bl_ranking.data.ingest import sanitise
+
+    with pytest.raises(ValueError, match="session_dt arrived as a numeric column"):
+        sanitise(_gate_frame(rows=3, session_dt=[20260115, 20260116, 20260117]))
+
+    # An all-empty column arrives as float64 too, and is not the same thing: no values.
+    clean, _ = sanitise(_gate_frame(
+        rows=3, register_date=pd.Series([np.nan] * 3, dtype="float64")))
+    assert clean["register_date"].isna().all()

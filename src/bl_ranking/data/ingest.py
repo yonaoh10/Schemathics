@@ -312,7 +312,21 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     # exactly what pd.read_csv would have handed the research code.
     timestamp_fallbacks = 0
     for col in ("session_dt", "conversion_dt", "register_date"):
-        parsed, fallback_rows = _to_utc_naive(frame[col])
+        # A numeric timestamp column is refused rather than parsed. pandas reads an
+        # integer as nanoseconds since the epoch, so a funnel switching to a YYYYMMDD
+        # integer date turns every row into 1970-01-01 - one value for the whole column,
+        # no row dropped, no repair counted, and session_day and session_day_of_week are
+        # model features. There is no way to tell 20260115 (a date) from 20260115 (a
+        # nanosecond count) from inside this function, so it says so instead of picking.
+        # An all-empty column arrives as float64 too and is not this: it has no values.
+        values = frame[col]
+        if pd.api.types.is_numeric_dtype(values) and bool(values.notna().any()):
+            raise ValueError(
+                f"{col} arrived as a numeric column ({values.dtype}). pandas reads a "
+                f"number there as nanoseconds since 1970, so every row would become "
+                f"1970-01-01 with nothing to show it. Export it as a timestamp string."
+            )
+        parsed, fallback_rows = _to_utc_naive(values)
         # A row the first pass could not read and the second could is a row whose
         # format differs from the rest of its column, and pandas then infers the
         # layout: '06/01/2026' becomes June 1st or January 6th depending on what it
