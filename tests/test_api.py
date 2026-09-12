@@ -257,3 +257,28 @@ def test_an_unexpected_failure_on_the_bare_endpoint_is_counted(client, monkeypat
     assert response.status_code == 500
     assert 'bl_rank_requests_total{outcome="error"}' in client.get("/metrics").text
 
+@pytest.mark.parametrize("value", ["1" + "0" * 400, "9" * 20, "junk"])
+def test_a_campaign_id_too_large_for_int64_degrades_like_training(client, value):
+    """The training column is int64, so a larger id is the 0 level there.
+
+    Without the same bound at serving the Python int reached CatBoost, which raised on
+    anything past float range - a 500 leaking a library message - and silently scored
+    everything below it differently from how training saw it.
+    """
+    from bl_ranking.serving.schemas import RankRequest
+
+    assert RankRequest(**(dict(WARMUP_USER) | {"campaign_id": value})).campaign_id == 0
+    assert client.post("/rank", json=dict(WARMUP_USER) | {"campaign_id": value}).status_code == 200
+
+
+def test_a_timestamp_pair_that_cannot_be_subtracted_is_refused(client):
+    """pandas can hold 1677..2262 but a timedelta spans only ~292 years.
+
+    `from_start_to_register` subtracts the two, so a pair the schema accepted
+    individually could still overflow - and the research path raised while the
+    vectorised path returned a ranking, breaking the equivalence contract on input
+    neither implementation should have taken.
+    """
+    body = dict(WARMUP_USER) | {"session_dt": "1700-01-01 00:00:00"}
+    assert client.post("/rank", json=body).status_code == 422
+

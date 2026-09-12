@@ -605,3 +605,25 @@ def test_an_unreachable_registry_does_not_undo_a_rollback(bundle, settings, monk
     monkeypatch.setattr(settings.mlflow, "tracking_uri", None, raising=False)
     assert model_source.resolve_bundle(settings).exists()
 
+def test_one_malformed_cell_does_not_fail_the_whole_pyfunc_batch(bundle, settings):
+    """Per-row isolation has to survive the normalisation step too.
+
+    `pd.isna` returns an array for a list cell, and branching on that raises "truth
+    value of an array is ambiguous" - which escaped the per-row handler and failed
+    every row in the batch over one bad cell.
+    """
+    import pandas as pd
+
+    from bl_ranking.serving.pyfunc import BrandRankerModel
+    from bl_ranking.serving.ranker import WARMUP_USER, BrandRanker
+
+    model = BrandRankerModel()
+    model._ranker = BrandRanker.load(bundle, settings)
+
+    good = dict(WARMUP_USER)
+    frame = model.predict(None, pd.DataFrame([good, dict(good) | {"fname": ["a", "b"]}, good]))
+
+    assert len(frame) == 3
+    assert frame["error"][0] is None and frame["error"][2] is None
+    assert frame["error"][1] is not None
+

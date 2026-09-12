@@ -29,7 +29,9 @@ def test_a_value_containing_a_colon_stays_a_string(monkeypatch):
     assert settings.mlflow.experiment == "a: b"
 
 
-@pytest.mark.parametrize("value", ["many", "3.7", ""])
+# "" is deliberately absent: an empty variable means "unset", not "invalid".
+# See test_an_empty_override_is_ignored_not_fatal.
+@pytest.mark.parametrize("value", ["many", "3.7", "1e3", "0x10"])
 def test_a_non_integer_for_an_integer_setting_is_refused(monkeypatch, value):
     """The string 'many' used to reach uvicorn as a worker count."""
     with pytest.raises(ValueError, match="serving.workers"):
@@ -79,3 +81,17 @@ def test_valid_overrides_still_apply(monkeypatch):
 def test_the_shipped_config_file_is_valid():
     """conf/config.yaml must satisfy the rules it is the example of."""
     assert Settings.load() is not None
+
+@pytest.mark.parametrize("key", ["BL_SERVING__WORKERS", "BL_MODEL__PAYOUT__BACKEND"])
+def test_an_empty_override_is_ignored_not_fatal(monkeypatch, key):
+    """`BL_X=${BL_X:-}` is ordinary in compose files and .env templates.
+
+    A shell exports that as an empty string rather than omitting the variable. Treating
+    it as a value made an empty BL_SERVING__WORKERS abort the worker at import, which
+    is worse than ignoring a variable nobody filled in.
+    """
+    monkeypatch.setenv(key, "")
+    settings = Settings.load()
+    assert settings.serving.workers == 3
+    assert settings.model.payout.backend in {"surrogate", "catboost_fallback"}
+

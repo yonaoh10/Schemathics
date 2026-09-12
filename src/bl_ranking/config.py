@@ -233,6 +233,13 @@ def _env_overrides() -> dict[str, Any]:
     for key, value in os.environ.items():
         if not key.startswith(ENV_PREFIX) or key == "BL_CONFIG":
             continue
+        if value == "":
+            # An empty value means "not set". Compose files and .env templates carry
+            # `BL_X=${BL_X:-}` as a matter of course, and a shell exports that as an
+            # empty string rather than omitting the variable. Treating it as a value
+            # made an empty BL_SERVING__WORKERS abort the worker at import, which is a
+            # far worse outcome than ignoring a variable nobody filled in.
+            continue
         parts = key[len(ENV_PREFIX):].lower().split(NESTING_SEPARATOR)
         cursor = out
         for index, part in enumerate(parts[:-1]):

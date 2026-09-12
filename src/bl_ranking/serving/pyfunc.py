@@ -77,6 +77,10 @@ class BrandRankerModel(mlflow.pyfunc.PythonModel):
                 errors.append(f"invalid_request: {exc.error_count()} field(s)")
                 rankings.append(json.dumps({}))
                 continue
+            except Exception as exc:  # noqa: BLE001 - one bad row must not fail a batch
+                errors.append(f"invalid_request: {type(exc).__name__}")
+                rankings.append(json.dumps({}))
+                continue
             try:
                 ranking = self._ranker.rank(user)
             except InsufficientSurveyData:
@@ -99,9 +103,25 @@ class BrandRankerModel(mlflow.pyfunc.PythonModel):
 
 
 def _scrub(record: dict[str, Any]) -> dict[str, Any]:
-    """pandas renders a missing value as NaN; the request schema expects None."""
-    return {k: (None if not isinstance(v, str) and pd.isna(v) else v)
-            for k, v in record.items()}
+    """pandas renders a missing value as NaN; the request schema expects None.
+
+    `pd.isna` returns an *array* for a list or array cell, and `if` on that raises
+    "truth value of an array is ambiguous" - which escaped the per-row handler and
+    failed the entire batch over one malformed cell. Only scalars are tested; anything
+    else is passed through for RankRequest to reject as the single bad row it is.
+    """
+    return {k: (None if _is_missing(v) else v) for k, v in record.items()}
+
+
+def _is_missing(value: Any) -> bool:
+    if isinstance(value, str):
+        return False
+    if isinstance(value, list | tuple | dict | set) or hasattr(value, "__len__"):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 def _as_frame(model_input: Any) -> pd.DataFrame:
     if isinstance(model_input, pd.DataFrame):

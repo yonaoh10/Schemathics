@@ -31,9 +31,19 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # What pandas can actually hold: datetime64[ns] is an int64 count of nanoseconds since
 # 1970. A margin is kept off each end so arithmetic on the value cannot overflow either.
-# Whole days, so the conversion carries no sub-microsecond remainder to discard.
-_TIMESTAMP_MIN = (pd.Timestamp.min + pd.Timedelta(days=1)).floor("D").to_pydatetime()
-_TIMESTAMP_MAX = (pd.Timestamp.max - pd.Timedelta(days=1)).floor("D").to_pydatetime()
+# Funnel timestamps, bounded to a range where every operation on them is defined.
+#
+# pandas can *hold* 1677..2262, but a timedelta64[ns] spans only ~292 years, so two
+# timestamps the schema accepted individually could still overflow when subtracted -
+# and `from_start_to_register` subtracts them. The research path raised while the
+# vectorised path returned a ranking, which breaks the equivalence contract on input
+# neither implementation should have accepted.
+#
+# The epoch is the floor because these are web-session timestamps: a session before
+# 1970 is a malformed field, not a very old lead. The ceiling keeps the whole window
+# inside one timedelta span.
+_TIMESTAMP_MIN = datetime(1970, 1, 1)
+_TIMESTAMP_MAX = datetime(2200, 1, 1)
 
 
 class RankRequest(BaseModel):
@@ -46,7 +56,7 @@ class RankRequest(BaseModel):
     register_date: str = Field(
         description="Survey submission time. A user without one cannot become a lead."
     )
-    campaign_id: int | str = Field(validate_default=True)
+    campaign_id: int | str
     page: str
     auto_city: str | None = None
     auto_country: str | None = None
@@ -119,13 +129,21 @@ class RankRequest(BaseModel):
             return 0
         text = str(value).strip()
         try:
-            return int(text)
+            number = int(text)
         except ValueError:
             try:
                 # '1.2e17' and '120227360861540306.0' both appear in real extracts.
-                return int(float(text))
+                number = int(float(text))
             except (ValueError, OverflowError):
                 return 0
+        # The same bound data/ingest._as_int64 applies, and for the same reason: the
+        # training column is int64, so a larger value is the 0 level there. Without it
+        # the Python int travelled into the feature matrix, where CatBoost raised on
+        # anything past float range - a 500 carrying a library message - and silently
+        # scored everything below it differently from how training saw it.
+        if not (_INT64_MIN <= number <= _INT64_MAX):
+            return 0
+        return number
 
     @field_validator("cellphone", mode="before")
     @classmethod
