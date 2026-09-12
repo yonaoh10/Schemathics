@@ -240,11 +240,29 @@ def run_scheduler(settings: Settings | None = None, run_now: bool = False) -> No
 
 
 def _train() -> None:
+    """The weekly job: the same three steps, in the same order, as the Databricks job.
+
+    All three, because this ran only the middle one. The Databricks job ingests, trains and
+    then evaluates; this scheduler called `run(train_test=False)` and nothing else - so the
+    documented local analogue retrained on whichever Delta version happened to be current
+    when the container started, week after week, and the researcher log and the comparable
+    metrics were never produced at all. A frozen input is the worst version of that: every
+    weekly run reports a new model version trained on data that has not moved.
+
+    Ingest failing stops the week: training on a stale snapshot while believing it was
+    fresh is what this exists to prevent. Evaluation failing does not, because the model is
+    already registered by then and its numbers are a report rather than a gate - which is
+    also why it runs last here and last on Databricks.
+    """
+    from bl_ranking.data.ingest import ingest
     from bl_ranking.training.job import run
 
     started = time.perf_counter()
-    log.info("weekly production retrain starting")
+    log.info("weekly retrain starting: ingest, train, evaluate")
     try:
+        report = ingest()
+        log.info("ingested %s rows -> %s rows, delta version %s",
+                 f"{report.rows_in:,}", f"{report.rows_out:,}", report.delta_version)
         result = run(train_test=False)
         log.info("retrain finished in %.1fs: run=%s version=%s",
                  time.perf_counter() - started, result.run_id, result.model_version)
@@ -252,6 +270,15 @@ def _train() -> None:
         # A failed retrain must not kill the scheduler: the currently aliased version
         # keeps serving, and the next window gets another attempt.
         log.exception("weekly retrain failed; the champion alias is unchanged")
+        return
+
+    try:
+        evaluation = run(train_test=True)
+        log.info("evaluation finished: run=%s", evaluation.run_id)
+    except Exception:
+        # Deliberately not fatal, and deliberately after registration: the version is
+        # already serving, and a missing report is not a reason to hold it back.
+        log.exception("weekly evaluation failed; the registered version is unaffected")
 
 
 def _now():

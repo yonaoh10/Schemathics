@@ -6,7 +6,9 @@ Resolution order, first match wins:
      `models:/<name>@<alias>`, `models:/<name>/<version>`, or a local directory.
   2. `models:/<registered_model>@<serving_alias>` - the normal production path.
   3. The newest local `runs/*/bundle` - so the repo runs offline, straight after
-     `make train`, with no tracking server.
+     `make train-prod`, with no tracking server. `train-prod`, not `train`: the
+     evaluation mode registers nothing and writes no bundle, so there would be nothing
+     for this tier to find.
 
 Rollback is deliberately an operation on the registry, not on the containers:
 

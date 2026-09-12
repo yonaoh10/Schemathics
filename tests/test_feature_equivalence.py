@@ -174,3 +174,22 @@ def test_a_missing_register_date_is_refused_with_the_same_type_by_both(paths, ex
     for ranker in (research, fast):
         with pytest.raises(MissingRegisterDate):
             ranker.rank(user)
+
+
+def test_the_band_sentinel_signal_is_the_same_on_both_paths(paths, example_user):
+    """It is computed from the shared band_values rather than re-derived, so the metric
+    cannot disagree with the numbers the model was given - on either feature path."""
+    from bl_ranking.serving import fast_features
+
+    renamed = {**example_user, "credit_score": "Reasonably Good", "loan_amount": "a lot"}
+    bands = fast_features.band_values(fast_features.survey_answers(renamed))
+    assert set(fast_features.band_sentinels(bands)) == {"credit_score_num",
+                                                       "loan_amount_num"}
+
+    # And the built row agrees with it, which is what "cannot disagree" means here.
+    row = fast_features.build_feature_row(renamed, None)
+    assert set(fast_features.band_sentinels(row)) == set(fast_features.band_sentinels(bands))
+
+    # Both rankers still answer; a sentinel is a signal, not a refusal.
+    research, fast = paths
+    assert research.rank(renamed) and fast.rank(renamed)

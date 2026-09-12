@@ -487,17 +487,23 @@ def _inject_edge_cases(rng: np.random.Generator, rows: pd.DataFrame) -> pd.DataF
 
 def write_csv(settings: Settings | None = None, sessions: int | None = None,
               seed: int | None = None, out: Path | None = None,
-              overwrite: bool = False) -> Path:
-    """Write the generated extract to paths.raw_csv. Never clobbers a real file."""
+              overwrite: bool = False) -> tuple[Path, bool]:
+    """Write the generated extract to paths.raw_csv, and say whether it wrote anything.
+
+    Never clobbers a real file - an operator who has dropped their own bl_full_data.csv
+    there keeps it. It returns *whether* it wrote, because the caller was printing
+    "wrote <path>" either way: `make data` over a private extract reported that it had just
+    been replaced with synthetic rows, which is an alarming thing to be told incorrectly.
+    """
     settings = settings or Settings.load()
     target = out or settings.paths.raw_csv
     target = resolve(target)
     if target.exists() and not overwrite:
-        return target
+        return target, False
     target.parent.mkdir(parents=True, exist_ok=True)
     frame = generate(settings, sessions=sessions, seed=seed)
     frame.to_csv(target, index=False)
-    return target
+    return target, True
 
 
 def main() -> None:
@@ -509,10 +515,14 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = Settings.load()
-    path = write_csv(settings, sessions=args.sessions, seed=args.seed,
-                     out=args.out, overwrite=args.overwrite)
+    path, written = write_csv(settings, sessions=args.sessions, seed=args.seed,
+                              out=args.out, overwrite=args.overwrite)
     frame = pd.read_csv(path, low_memory=False)
-    print(f"wrote {path}")
+    if written:
+        print(f"wrote {path}")
+    else:
+        print(f"kept {path} - it already exists, and this never clobbers a real extract. "
+              f"Pass --overwrite to replace it with synthetic rows.")
     print(f"  rows           {len(frame):,}")
     print(f"  sessions       {frame['session_id'].nunique():,}")
     print(f"  registered     {frame['register_date'].notna().sum():,}")

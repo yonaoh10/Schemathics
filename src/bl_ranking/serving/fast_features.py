@@ -170,12 +170,13 @@ def _user_row(user: dict[str, Any], gender_lookup=None) -> dict[str, Any]:
 
     # -- impute_survey_columns, lines 88-95 ----------------------------------------
     require_survey_answers(user)
-    survey = {col: _lower_or_other(user[col]) for col in SURVEY_COLUMNS}
+    survey = survey_answers(user)
 
     # -- the four band mappings, lines 98-155 --------------------------------------
-    credit_score_num = _credit_score_to_numeric(survey["credit_score"])
-    loan_amount_num = _loan_amount_to_numeric(survey["loan_amount"])
-    monthly_revenue_num = _monthly_revenue_to_numeric(survey["monthly_revenue"])
+    bands = band_values(survey)
+    credit_score_num = bands["credit_score_num"]
+    loan_amount_num = bands["loan_amount_num"]
+    monthly_revenue_num = bands["monthly_revenue_num"]
     # map(...).fillna(0) - an unmapped answer becomes 0, "impute worse case".
     time_in_business_num = float(TIME_IN_BUSINESS_MAP.get(survey["time_in_business"], 0))
 
@@ -274,6 +275,43 @@ def _lower_or_other(value: Any) -> str:
         return "other"
     lowered = value.lower()
     return lowered if len(lowered) > 1 else "other"
+
+
+# What each band mapping returns when nothing matched. A copy change that renames a funnel
+# answer sends every user here silently: the feature still has a value, the request still
+# succeeds, and the model scores everyone as if their credit score were unknown.
+BAND_SENTINEL = -99
+
+BAND_FEATURES: tuple[str, ...] = ("credit_score_num", "loan_amount_num",
+                                  "monthly_revenue_num")
+
+
+def band_values(survey: dict[str, str]) -> dict[str, int]:
+    """The three band mappings, in one place so nothing can compute them twice differently.
+
+    Takes the lower-cased survey answers - `_lower_or_other` applied - rather than the raw
+    request, because that is what the research code maps and computing it twice is how the
+    two sides of this system have drifted before.
+    """
+    return {
+        "credit_score_num": _credit_score_to_numeric(survey["credit_score"]),
+        "loan_amount_num": _loan_amount_to_numeric(survey["loan_amount"]),
+        "monthly_revenue_num": _monthly_revenue_to_numeric(survey["monthly_revenue"]),
+    }
+
+
+def survey_answers(user: dict[str, Any]) -> dict[str, str]:
+    """The survey columns as the research code sees them: lowered, short answers dropped."""
+    return {col: _lower_or_other(user[col]) for col in SURVEY_COLUMNS}
+
+
+def band_sentinels(values: dict[str, Any]) -> tuple[str, ...]:
+    """Which band mappings fell through to the sentinel.
+
+    Takes anything carrying the three keys - a built feature row or the output of
+    `band_values` - so the caller never has to recompute what the model was given.
+    """
+    return tuple(name for name in BAND_FEATURES if values.get(name) == BAND_SENTINEL)
 
 
 def _credit_score_to_numeric(value: str) -> int:

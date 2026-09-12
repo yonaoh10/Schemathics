@@ -2,19 +2,26 @@
 
 The research class is subclassed, not edited. Every feature-engineering method, the
 CatBoost configuration, the time split and the artifact-writing behaviour are inherited
-exactly as written. Two methods are overridden, for reasons that are deployment
-concerns rather than modelling ones:
+exactly as written. Four methods are overridden. One of them changes what happens; the
+other three only watch.
 
-  tabpfn_regression_payout          the estimator comes from the backend registry
-                                    instead of being hard-wired to the hosted API.
-                                    The context is still the last `CONTEXT_SIZE` rows
-                                    with payout > 0, in the same order.
+  tabpfn_regression_payout          the one that changes something: the estimator comes
+                                    from the backend registry instead of being hard-wired
+                                    to the hosted API. The context is still the last
+                                    `CONTEXT_SIZE` rows with payout > 0, in the same
+                                    order.
 
   accuracy_* (two methods)          call super() first, so the researcher log is
                                     written byte for byte as before, then capture the
                                     same numbers so MLflow can compare runs. Nothing
                                     is recomputed differently; the arrays are the ones
                                     the research code already produced.
+
+  split_by_time                     calls super() and records the row counts. The split
+                                    itself is untouched - the point is that it happens in
+                                    *both* modes, so the fit never sees the last
+                                    `days_for_test` days, and the run should say so
+                                    rather than report the snapshot size as if it had.
 
 Anything else this file adds is around the edges: run directories, log-handler hygiene,
 and a metrics dictionary.

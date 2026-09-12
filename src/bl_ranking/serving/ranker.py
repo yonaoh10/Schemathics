@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,10 @@ class BrandRanker:
     def __init__(self, warm: WarmModels, feature_path: str = "fast") -> None:
         self.warm = warm
         self.feature_path = feature_path
+        # Set by the serving layer to a metric increment. A callback rather than a
+        # Prometheus import here, because this class is also what the tests and the pyfunc
+        # use and neither should pull a metrics registry in to score a row.
+        self.on_band_sentinels: Callable[[str], None] | None = None
         # CatBoost and the payout backends are read-only once fitted, but pandas
         # operations on shared frames are not guaranteed re-entrant. The lock keeps a
         # worker honest; parallelism comes from running several worker processes, which
@@ -199,6 +204,16 @@ class BrandRanker:
         """
         fast_features.require_survey_answers(user)
         fast_features.require_register_date(user)
+        # Which band mappings fell through to -99 for this request, on either path.
+        # docs/design.md has promised this signal for a while: a copy change that renames a
+        # funnel answer sends every user to the sentinel silently - the feature still has a
+        # value, the request still succeeds, and it shows up as revenue rather than as an
+        # error. Computed from the shared band_values so it cannot disagree with what the
+        # model was given, and reported by the serving layer as a counter.
+        if self.on_band_sentinels is not None:
+            bands = fast_features.band_values(fast_features.survey_answers(user))
+            for feature in fast_features.band_sentinels(bands):
+                self.on_band_sentinels(feature)
         if self.feature_path == "research":
             return self._rank_via_research_pipeline(user)
         return self._rank_fast(user)

@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import json
 import platform
+import re
 import shutil
 import sys
 import time
@@ -287,7 +288,12 @@ def assert_config_mirrors_research(settings: Settings) -> None:
         value = flat.get(key)
         if value is None:
             continue
-        if template.format(value=value) not in source:
+        # Bounded, not a substring search. `"n_estimators=8" in source` is true of
+        # `n_estimators=800`, so BL_MODEL__CATBOOST__N_ESTIMATORS=8 passed this check and
+        # the run logged 8 for a model fitted with 800 - which is the exact failure the
+        # check exists to prevent, reintroduced by the way it was spelled.
+        needle = re.escape(template.format(value=value))
+        if not re.search(needle + r"(?![0-9A-Za-z_.])", source):
             wrong.append((key, value, template))
     if wrong:
         raise ValueError(

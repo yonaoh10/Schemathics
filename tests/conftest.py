@@ -63,7 +63,12 @@ def settings(workspace):
 def raw_csv(settings) -> Path:
     from bl_ranking.data.generate import write_csv
 
-    return write_csv(settings, overwrite=True)
+    # write_csv reports whether it actually wrote, because `make data` used to print
+    # "wrote <path>" over an untouched private extract. Here overwrite=True, so it always
+    # does; the assertion keeps the fixture honest if that ever changes.
+    path, written = write_csv(settings, overwrite=True)
+    assert written
+    return path
 
 
 @pytest.fixture(scope="session")

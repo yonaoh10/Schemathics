@@ -1866,3 +1866,37 @@ def test_no_shipped_launcher_pins_the_serving_backend():
     assert "origin BACKEND" in serve_target, (
         "make serve must pass BACKEND through only when it was asked for on the command "
         f"line, got: {serve_target!r}")
+
+
+@pytest.mark.parametrize("value", [8, 80, 8000, 2])
+def test_a_mirrored_hyperparameter_is_matched_exactly(value):
+    """`"n_estimators=8" in source` is true of `n_estimators=800`, so
+    BL_MODEL__CATBOOST__N_ESTIMATORS=8 passed the check and the run logged 8 for a model
+    fitted with 800 - the exact failure the check exists to prevent, reintroduced by the way
+    it was spelled."""
+    from bl_ranking.training.job import assert_config_mirrors_research
+
+    settings = Settings.load()
+    settings.model.catboost.n_estimators = value
+    with pytest.raises(ValueError, match="n_estimators"):
+        assert_config_mirrors_research(settings)
+
+
+def test_the_weekly_job_runs_the_three_steps_it_documents():
+    """The scheduler called run(train_test=False) and nothing else, so the documented local
+    analogue of the Databricks job retrained on whichever Delta version was current when the
+    container started - week after week - and never produced the researcher log or the
+    comparable metrics at all."""
+    import inspect
+
+    from bl_ranking.ops import schedule
+
+    # The docstring names the same calls it explains, so search the body only.
+    source = inspect.getsource(schedule._train).replace(schedule._train.__doc__ or "", "")
+    assert "ingest()" in source, "the weekly job must refresh its input"
+    assert "train_test=False" in source, "it must register a version"
+    assert "train_test=True" in source, "it must produce the evaluation report"
+    # Ingest failing has to stop the week; evaluation failing must not.
+    assert source.index("ingest()") < source.index("train_test=False")
+    assert source.index("train_test=False") < source.index("train_test=True")
+    assert "return" in source.split("train_test=False", 1)[1].split("train_test=True", 1)[0]
