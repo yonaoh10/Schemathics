@@ -426,3 +426,42 @@ def test_attribution_ids_survive_the_csv_staging_round_trip(tmp_path):
     )
     # The null still means what it always meant.
     assert training_levels[1] == "Other"
+
+def test_a_bundle_with_mismatched_feature_order_is_refused(bundle, settings, tmp_path):
+    """The mis-slotting hazard the atomic bundle exists to prevent, as a test.
+
+    `prediction_expected_payout` reorders the frame by the payout model's column list
+    before handing it to the classifier. If those two disagree the features are scored
+    in the wrong slots - industry as page, city as device_type - with no error and no
+    log line, just a quietly worse ranking for as long as that version is champion.
+
+    Before the load-time check, a permuted column list loaded clean and changed the
+    returned ordering.
+    """
+    import shutil
+
+    import joblib
+    import pytest
+
+    from bl_ranking.models import bundle as bundle_files
+    from bl_ranking.serving.ranker import BrandRanker
+
+    damaged = tmp_path / "bundle"
+    shutil.copytree(bundle, damaged)
+
+    context = joblib.load(damaged / bundle_files.PAYOUT_CONTEXT_FILE)
+    columns = list(context["columns"])
+    columns[1], columns[2] = columns[2], columns[1]
+    context["columns"] = columns
+    joblib.dump(context, damaged / bundle_files.PAYOUT_CONTEXT_FILE)
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        BrandRanker.load(damaged, settings)
+
+
+def test_a_healthy_bundle_passes_the_consistency_check(bundle, settings):
+    """The guard must not reject what training actually produces."""
+    from bl_ranking.serving.ranker import BrandRanker
+
+    assert BrandRanker.load(bundle, settings) is not None
+

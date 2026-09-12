@@ -39,7 +39,7 @@ class RankRequest(BaseModel):
     register_date: str = Field(
         description="Survey submission time. A user without one cannot become a lead."
     )
-    campaign_id: int | str
+    campaign_id: int | str = Field(validate_default=True)
     page: str
     auto_city: str | None = None
     auto_country: str | None = None
@@ -57,7 +57,11 @@ class RankRequest(BaseModel):
     time_in_business: str | None = None
     fname: str | None = None
     lname: str | None = None
-    cellphone: int | str | None = None
+    # validate_default: a `before` validator does not run when the key is absent,
+    # so without this an omitted cellphone stayed None and took down the request
+    # inside the research pipeline's `.astype(int)` - a 500 for a field the
+    # schema calls optional.
+    cellphone: int | str | None = Field(default=None, validate_default=True)
 
     @field_validator("session_dt", "register_date", mode="before")
     @classmethod
@@ -91,6 +95,31 @@ class RankRequest(BaseModel):
             return None
         return _normalise_timestamp(value, required=False)
 
+    @field_validator("campaign_id", mode="before")
+    @classmethod
+    def normalise_campaign_id(cls, value: Any) -> int:
+        """Make it the numeric feature the model was fitted on.
+
+        `campaign_id` is a *numeric* column in training: data/ingest.sanitise does
+        `pd.to_numeric(errors="coerce").fillna(0).astype("int64")`. The schema accepts a
+        string because a JSON caller may quote a 17-digit id to protect it from a
+        float, but an unparseable one used to travel all the way to CatBoost and come
+        back as a 500 carrying a library error message. Coercing here applies the same
+        rule the training data got, so a junk id degrades to the 0 level on both sides
+        instead of failing the request.
+        """
+        if value is None:
+            return 0
+        text = str(value).strip()
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                # '1.2e17' and '120227360861540306.0' both appear in real extracts.
+                return int(float(text))
+            except (ValueError, OverflowError):
+                return 0
+
     @field_validator("cellphone", mode="before")
     @classmethod
     def normalise_cellphone(cls, value: Any) -> int:
@@ -113,12 +142,23 @@ class RankRequest(BaseModel):
 
 
 def _normalise_timestamp(value: Any, required: bool) -> str | None:
-    """Parse, convert any offset to UTC, and render naive. Raises on unparseable input."""
+    """Parse, convert any offset to UTC, and render naive. Raises on unparseable input.
+
+    A list or dict reaching pd.to_datetime comes back as a DatetimeIndex rather than a
+    scalar, and `.strftime` on that returns an array. Pydantic then cannot render the
+    field, and FastAPI's own validation-error encoder raises while trying to report the
+    problem - turning a malformed payload into a 500 that the endpoint's error handler
+    never sees. Reject non-scalars at the top so they become an ordinary 422.
+    """
+    if isinstance(value, list | tuple | dict | set):
+        raise ValueError(f"expected a timestamp string, got {type(value).__name__}")
     if isinstance(value, datetime):
         parsed = value
     else:
         parsed = pd.to_datetime(value, errors="coerce")
-        if parsed is pd.NaT or (hasattr(parsed, "__len__") is False and pd.isna(parsed)):
+        if hasattr(parsed, "__len__"):
+            raise ValueError(f"expected a single timestamp, got {type(parsed).__name__}")
+        if parsed is pd.NaT or pd.isna(parsed):
             if required:
                 raise ValueError(f"{value!r} is not a parseable timestamp")
             return None

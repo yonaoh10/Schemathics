@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from bl_ranking.serving.ranker import WARMUP_USER
 from bl_ranking.serving.schemas import RankRequest
 
 
@@ -173,3 +174,47 @@ def test_worker_that_cannot_load_a_model_reports_alive_but_not_ready(monkeypatch
             assert cold.post("/rank", json={}).status_code in (422, 503)
     finally:
         app_module.state.ranker, app_module.state.error = saved
+
+
+# A malformed request is a 422. A 500 on the funnel's critical path is an outage, and
+# every case below returned one before these were written.
+@pytest.mark.parametrize("field,value", [
+    ("campaign_id", "not-a-number"),   # declared int|str, but a numeric model feature
+    ("session_dt", ["2026-01-06 19:24:22"]),  # a list escaped the scalar check
+    ("session_dt", {"when": "now"}),
+    ("session_dt", "not a date"),
+])
+def test_malformed_fields_are_rejected_not_crashed(client, field, value):
+    body = dict(WARMUP_USER) | {field: value}
+    response = client.post("/rank", json=body)
+    assert response.status_code != 500, response.text
+    assert response.status_code in (200, 422), response.status_code
+
+
+def test_an_omitted_cellphone_is_normalised_like_an_explicit_null(client):
+    """`cellphone` is optional, and omitting it used to be a 500.
+
+    A `before` validator does not run for an absent key, so the documented
+    normalisation to 0 was skipped in exactly the case it was written for, and the
+    research pipeline's `.astype(int)` took the request down.
+    """
+    omitted = dict(WARMUP_USER)
+    omitted.pop("cellphone", None)
+    explicit = dict(WARMUP_USER) | {"cellphone": None}
+
+    a = client.post("/rank", json=omitted)
+    b = client.post("/rank", json=explicit)
+    assert a.status_code == 200, a.text
+    assert b.status_code == 200, b.text
+    assert a.json()["ranking"] == b.json()["ranking"]
+
+
+def test_a_quoted_campaign_id_keeps_every_digit(client):
+    """Real ids exceed 2^53, so a caller may quote one to keep it out of a float."""
+    from bl_ranking.serving.schemas import RankRequest
+
+    exact = 120227360861540306
+    assert RankRequest(**(dict(WARMUP_USER) | {"campaign_id": str(exact)})).campaign_id == exact
+    # Junk degrades to the same 0 level the ingestion gate assigns it, not a 500.
+    assert RankRequest(**(dict(WARMUP_USER) | {"campaign_id": "junk"})).campaign_id == 0
+

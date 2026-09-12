@@ -116,6 +116,8 @@ class BrandRanker:
             thread_count=settings.serving.threads_per_worker,
         ).load_model(str(directory / bundle_files.CATBOOST_FILE), format="cbm")
 
+        _assert_columns_match_the_classifier(catboost, context.columns, directory)
+
         # The bundle records which backend produced it; that wins over local config,
         # so a rollback to an older version brings its own backend with it.
         backend_name = manifest.payout_backend or settings.model.payout.backend
@@ -265,6 +267,40 @@ def install_warning_capture() -> None:
     warnings.showwarning = _warn
     _warning_capture_installed = True
 
+
+
+def _assert_columns_match_the_classifier(
+    catboost: CatBoostClassifier, columns: list[str], directory: Path
+) -> None:
+    """Refuse a bundle whose feature order does not match what the model was fitted on.
+
+    `prediction_expected_payout` reorders the frame by the payout model's column list
+    and hands it to the classifier, so if the two disagree the features are silently
+    mis-slotted: industry scored as page, city as device_type. There is no error and no
+    log line - just a worse ranking, for as long as that version is the champion.
+
+    Registering the five files as one atomic version stops them being mixed across
+    runs, but it cannot catch a bundle that was written inconsistently in the first
+    place, or edited afterwards. CatBoost stores its own ordered feature names, so the
+    check costs nothing and is exact.
+
+    Raising here rather than warning is deliberate: the caller is a worker starting up,
+    /readyz stays 503, and the load balancer routes around it. A wrong ranking served
+    confidently is the more expensive failure.
+    """
+    fitted = list(catboost.feature_names_ or [])
+    if not fitted:
+        # An older model file may carry no names. Nothing to check against.
+        return
+    if fitted != list(columns):
+        raise ValueError(
+            f"Model bundle at {directory} is inconsistent: the payout context lists "
+            f"{len(columns)} feature columns but the classifier was fitted on "
+            f"{len(fitted)}, or in a different order. Scoring would mis-slot features "
+            f"silently. First difference at position "
+            f"{next((i for i, (a, b) in enumerate(zip(fitted, columns, strict=False)) if a != b), min(len(fitted), len(columns)))}: "
+            f"classifier expects {fitted!r}, bundle provides {list(columns)!r}"
+        )
 
 def _log_fallback(requested: str, exc: Exception) -> None:
     log.error(
