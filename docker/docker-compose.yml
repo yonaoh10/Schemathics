@@ -82,15 +82,18 @@ services:
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       TABPFN_TOKEN: ${TABPFN_TOKEN:-}
-      # Deliberately empty by default, not catboost_fallback.
+      # A *different* variable from the training services above, and empty by default.
       #
       # Serving reads the backend from the bundle it loaded unless an operator asked for
       # a different one, so that a rollback carries the backend its version was built
       # with. Pinning a default here made that second tier unreachable in every shipped
-      # deployment: a rolled-back surrogate bundle would have been served by the
-      # fallback regressor instead, silently and with a different ranking. An empty
-      # variable counts as unset (see config.env_override_keys), so the bundle wins.
-      BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-}
+      # deployment: a rolled-back surrogate bundle would have been served by the fallback
+      # regressor instead, silently and with a different ranking. An empty variable counts
+      # as unset (see config.env_override_keys), so the bundle wins.
+      #
+      # Sharing BL_PAYOUT_BACKEND with the training services would undo that the moment
+      # anyone set it - and .env.example sets it, because training does want a default.
+      BL_MODEL__PAYOUT__BACKEND: ${BL_SERVING_PAYOUT_BACKEND:-}
       BL_SERVING__WORKERS: ${BL_SERVING_WORKERS:-3}
       BL_SERVING__THREADS_PER_WORKER: "1"
     volumes:

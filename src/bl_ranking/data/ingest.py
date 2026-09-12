@@ -175,8 +175,11 @@ def ingest(settings: Settings | None = None, source: Path | None = None) -> Inge
     csv_path = resolve(source or settings.paths.raw_csv)
     if not csv_path.exists():
         raise FileNotFoundError(
-            f"{csv_path} not found. Drop the real bl_full_data.csv there, "
-            f"or run `make data` to generate a synthetic one."
+            f"{csv_path} not found. Locally: drop the real bl_full_data.csv there, or run "
+            f"`make data` for a synthetic one. On a job cluster there is no repository and "
+            f"no make: point paths.raw_dir (BL_PATHS__RAW_DIR) at the volume holding the "
+            f"extract - the Databricks bundle sets it to a Unity Catalog volume - and land "
+            f"the file there before the ingest task runs."
         )
 
     # low_memory=False matches the research code's own read; READ_AS_TEXT overrides

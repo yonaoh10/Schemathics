@@ -212,6 +212,15 @@ def _clip(value: Any, limit: int = 480) -> Any:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _package_dir() -> Path:
+    """This package's directory, whether it was installed or is being run from a checkout.
+
+    `Path(__file__).parents[1]` rather than an import of `bl_ranking`: this module is
+    inside the package, so the answer is already on disk here and needs no import.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
 def _research_dir() -> Path:
     """Where the vendored scripts actually live, source tree or installed wheel.
 
@@ -403,7 +412,14 @@ def _register(bundle_dir: Path, settings: Settings) -> str:
         artifacts={BUNDLE_ARTIFACT_KEY: str(bundle_dir)},
         # The research scripts and our package travel with the model so the artifact is
         # self-contained wherever it is deployed.
-        code_paths=[str(REPO_ROOT / "src" / "bl_ranking")],
+        #
+        # Resolved through the imported package, not through REPO_ROOT. REPO_ROOT is
+        # derived from this file's location, which is `src/bl_ranking/...` in a checkout
+        # and `site-packages/bl_ranking/...` in a wheel - so on Databricks it pointed at
+        # a `src/bl_ranking` directory inside the Python lib dir that does not exist, and
+        # log_model raised *after* the whole training run had finished. Same reasoning as
+        # _research_dir, which had to learn this first.
+        code_paths=[str(_package_dir())],
         signature=build_signature(),
         input_example=request_example(),
         registered_model_name=settings.mlflow.registered_model,

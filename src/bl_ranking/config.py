@@ -30,6 +30,13 @@ def _default_config_path() -> Path:
     If none exists, every setting falls back to its dataclass default and the run still
     works - `Settings.flat()` is logged to MLflow either way, so what was actually used
     is always recoverable from the run.
+
+    That tolerance is for the *search* only - cases 2 and 3. A path somebody named, by
+    BL_CONFIG or by argument, must exist: see Settings.load. The Databricks bundle pointed
+    BL_CONFIG at a file that was never synced to the workspace, and because a missing file
+    was fine everywhere, the weekly job read no config at all and said nothing about it -
+    for months it made no difference, because the file restates the dataclass defaults,
+    which is exactly the kind of coincidence that ends the first time someone edits it.
     """
     override = os.environ.get("BL_CONFIG")
     if override:
@@ -39,8 +46,6 @@ def _default_config_path() -> Path:
         return local
     return REPO_ROOT / "conf" / "config.yaml"
 
-
-DEFAULT_CONFIG = _default_config_path()
 
 # The two feature implementations, and the payout backends that exist. Kept here so a
 # typo in either is a start-up error naming the alternatives, not a silent default.
@@ -152,6 +157,20 @@ class Settings:
 
     @classmethod
     def load(cls, config_path: str | Path | None = None, **overrides: Any) -> Settings:
+        """Read the config file, apply environment and keyword overrides, validate.
+
+        A path somebody *named* - `config_path` here, or BL_CONFIG - must exist. Only the
+        default search may come up empty, because there every setting has a default and
+        the effective config is logged to MLflow either way. Conflating the two is what let
+        the Databricks bundle name a file that was never synced and read nothing at all.
+        """
+        named = config_path or os.environ.get("BL_CONFIG")
+        if named and not Path(named).exists():
+            raise FileNotFoundError(
+                f"config file {named} does not exist. A config file nobody asked for may "
+                f"be absent; one that was named may not - a run that quietly ignored it "
+                f"would report defaults it was never given."
+            )
         raw = _read_yaml(Path(config_path) if config_path else _default_config_path())
         _merge(raw, _env_overrides())
         _merge(raw, overrides)

@@ -265,10 +265,16 @@ teacher-labelled distillation sample. That is what the cluster node type in
 per worker, because the gender table replaced the library.
 
 **Weekly, Sunday 05:00.** A Databricks job with three tasks: ingest the extract into a
-Delta table, train on all data and register a version, then run the evaluation mode for
-the researcher log and the comparable metrics. Evaluation runs last so a slow report
-never delays the model reaching the endpoint. Locally the same three steps run from one
-APScheduler process reading the same Quartz string.
+Delta table, fit and register a version, then run the evaluation mode for the researcher
+log and the comparable metrics. Evaluation runs last so a slow report never delays the
+model reaching the endpoint. Locally the same three steps run from one APScheduler process,
+against a Quartz string copied into the bundle by hand — a bundle cannot read our config
+file — with a test that fails if the two ever differ.
+
+Not "train on all data", which is how this read for a long time: `bl_preprocessing` calls
+`split_by_time(bl_data, days_for_test=7)` unconditionally, so both modes fit on everything
+except the last week and production mode differs only in that it never scores it. Changing
+that would mean editing the given code; the run reports the real counts instead.
 
 Evaluation costs about as much as training, because it distils the same surrogate rather
 than evaluating a cheaper proxy. That is deliberate: the numbers in the researcher log

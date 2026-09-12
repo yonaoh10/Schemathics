@@ -1,0 +1,285 @@
+# Databricks Asset Bundle for the Business Loans brand-ranking system.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t prod
+#   databricks bundle run bl_weekly_training -t prod
+#
+# This is the deployment target the local docker-compose stack stands in for. The
+# mapping is one to one:
+#
+#   compose service   Databricks resource
+#   ---------------   -------------------
+#   mlflow            the workspace's tracking server and Unity Catalog registry
+#   train             the three tasks of bl_weekly_training
+#   scheduler         the job's `schedule` block below - no process of our own
+#   api               the bl_brand_ranker model serving endpoint
+#
+# The schedule is the same Quartz string as conf/config.yaml, so the local APScheduler
+# runner and this job fire at the same moment. It is a hand-copied duplicate - a bundle
+# cannot read our config file - so tests/test_pipeline.py pins the two strings together
+# and fails if either moves.
+#
+# This file lives at the repository root, and has to. A bundle's sync root is the
+# directory holding it, and everything it references must be inside: conf/config.yaml for
+# BL_CONFIG, and dist/ for the wheel it builds. While it sat in databricks/ neither was,
+# so the deploy had no wheel to install and BL_CONFIG named a file that was never
+# uploaded - and because a missing config file was tolerated everywhere, the job read no
+# config at all and said nothing about it.
+#
+# The workspace hosts below are placeholders. Replace both with the real workspace URLs
+# before deploying; `databricks bundle validate -t dev` will not object to them.
+
+bundle:
+  name: bl-brand-ranking
+
+# The sync root is this directory, so without these a deploy would upload the virtualenv,
+# every local training run and the whole MLflow store.
+sync:
+  exclude:
+    - .venv/**
+    - runs/**
+    - mlruns/**
+    - data/**
+    - loadtest/results/**
+    - "**/__pycache__/**"
+    - .git/**
+
+# Without this block the tasks below reference ./dist/*.whl and nothing ever produces it,
+# so `databricks bundle deploy` fails on a missing artifact. Declaring it makes the deploy
+# build the wheel from pyproject.toml first. `python -m build` is in the `dev` extra, so
+# `pip install -e '.[train,serve,dev]'` is enough to deploy.
+artifacts:
+  bl_ranking_wheel:
+    type: whl
+    path: .
+    build: python -m build --wheel
+
+variables:
+  catalog:
+    description: Unity Catalog catalog holding the session table and the model
+    default: main
+  schema:
+    description: Schema within the catalog
+    default: business_loans
+  notification_email:
+    description: Where failed retrains are reported
+    default: mlops@example.com
+  volume:
+    description: >-
+      Unity Catalog volume holding the raw extract and the Delta table. A volume, not a
+      table name: data/delta.py writes with delta-rs, which takes a filesystem path, and
+      a three-part table name would become a local directory of that name on the
+      cluster's ephemeral disk (it now refuses one outright).
+    default: bl_data
+  payout_backend:
+    description: surrogate | tabpfn_client | tabpfn_local | catboost_fallback
+    # Matches conf/config.yaml. It used to say tabpfn_local, which contradicted both the
+    # config default and the README's latency argument, and needed an extra that the
+    # library spec below cannot install.
+    default: surrogate
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-0000000000000000.0.azuredatabricks.net
+    variables:
+      catalog: main
+      schema: business_loans_dev
+    resources:
+      jobs:
+        bl_weekly_training:
+          # `mode: development` pauses schedules automatically; stated explicitly so
+          # nobody has to remember that.
+          schedule:
+            pause_status: PAUSED
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-0000000000000000.0.azuredatabricks.net
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+
+resources:
+  jobs:
+    bl_weekly_training:
+      name: "[${bundle.target}] BL brand ranking - weekly production retrain"
+
+      # Sunday 05:00 UTC. Quartz: second minute hour day-of-month month day-of-week year.
+      # '?' on day-of-month because day-of-week is the field in use - Quartz rejects
+      # both being set.
+      schedule:
+        quartz_cron_expression: "0 0 5 ? * SUN *"
+        timezone_id: "UTC"
+        pause_status: UNPAUSED
+
+      # A retrain must never overlap itself: two runs would race to move the
+      # `champion` alias and the loser's artifacts would be orphaned.
+      max_concurrent_runs: 1
+
+      email_notifications:
+        on_failure: ["${var.notification_email}"]
+        no_alert_for_skipped_runs: true
+
+      health:
+        rules:
+          # The job normally finishes in well under an hour; alert rather than let a
+          # hung run sit until the next week's window.
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 5400
+
+      job_clusters:
+        - job_cluster_key: training
+          new_cluster:
+            spark_version: "15.4.x-cpu-ml-scala2.12"
+            node_type_id: "Standard_D8ds_v5"
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            # num_workers: 0 on its own is a misconfigured cluster, and the Databricks
+            # CLI's own validator says so ("Single node cluster is not correctly
+            # configured"). These three lines are what make it a real single-node cluster:
+            # Spark runs in the driver, which is what a pandas + CatBoost job wants.
+            spark_conf:
+              "spark.master": "local[*, 4]"
+              "spark.databricks.cluster.profile": "singleNode"
+            custom_tags:
+              project: bl-brand-ranking
+              ResourceClass: SingleNode
+            spark_env_vars:
+              # The training job is single-node pandas and CatBoost; Spark is only the
+              # host. The run peaks around 9.5 GB on a two-month window: 2.4 GB of that
+              # is the names-dataset import the research code does at module scope.
+              #
+              # BL_CONFIG matters: the tasks run from a wheel in site-packages, which
+              # has no repository above it, so conf/config.yaml has to be named
+              # explicitly. Asset Bundles sync the project directory to workspace.file_path.
+              BL_CONFIG: "${workspace.file_path}/conf/config.yaml"
+              TABPFN_TOKEN: "{{secrets/bl_ranking/tabpfn_token}}"
+              TABPFN_DISABLE_TELEMETRY: "1"
+              # day_name() follows LC_TIME; a different locale emits a categorical level
+              # the model has never seen, with no error anywhere.
+              LC_ALL: "C.UTF-8"
+              BL_MODEL__PAYOUT__BACKEND: "${var.payout_backend}"
+              # Volume paths, not a table name. data/delta.py writes with delta-rs, which
+              # takes a filesystem path; a Unity Catalog volume is one on a cluster, so
+              # the same code works in both places. A three-part table name used to be set
+              # here and silently produced a local directory called
+              # "main.business_loans.bl_sessions" on the driver's ephemeral disk - the job
+              # reporting 81k rows ingested while the real table never changed.
+              BL_PATHS__DELTA_TABLE: "/Volumes/${var.catalog}/${var.schema}/${var.volume}/delta/bl_sessions"
+              BL_PATHS__RAW_DIR: "/Volumes/${var.catalog}/${var.schema}/${var.volume}/raw"
+              BL_MLFLOW__REGISTERED_MODEL: "${var.catalog}.${var.schema}.bl_brand_ranker"
+              # Both, not just the registry. Without the tracking URI, MLflow falls back to
+              # a local file store under the Python lib directory: every run of the weekly
+              # retrain logged its params, metrics and researcher log onto the driver's
+              # ephemeral disk and they vanished with the cluster, while the registry still
+              # got the model - so the version existed with no run behind it.
+              MLFLOW_TRACKING_URI: "databricks"
+              MLFLOW_REGISTRY_URI: "databricks-uc"
+
+      tasks:
+        # 1. Land the latest extract in the Delta table. Each run produces a new table
+        #    version, and the training task records which one it read. The extract itself
+        #    has to be in the volume named by BL_PATHS__RAW_DIR before this runs; the gate
+        #    refuses to guess, and says so naming the path it looked at.
+        - task_key: ingest
+          job_cluster_key: training
+          python_wheel_task:
+            package_name: bl_ranking
+            entry_point: bl-ingest
+          libraries:
+            # The wheel installs its *base* dependencies only - a `whl:` library spec has no
+            # way to ask for an extra - so every task of this job used to die at `import
+            # mlflow`. These are the `train` and `tabpfn` extras from pyproject.toml,
+            # pinned identically; tests/test_pipeline.py fails if the two lists drift.
+            - whl: ./dist/*.whl
+            - pypi: {package: "mlflow==2.19.0"}
+            - pypi: {package: "deltalake==0.24.0"}
+            - pypi: {package: "names-dataset==3.1.0"}
+            - pypi: {package: "tabpfn-client==0.5.3"}
+            - pypi: {package: "apscheduler==3.11.0"}
+            - pypi: {package: "tabpfn==8.5.0"}
+
+        # 2. Fit, register a version, move the champion alias. Not "train on everything":
+        #    the research code holds the last 7 days back in both modes - see
+        #    training/job.py.
+        - task_key: train_production
+          depends_on: [{task_key: ingest}]
+          job_cluster_key: training
+          python_wheel_task:
+            package_name: bl_ranking
+            entry_point: bl-train
+            parameters: ["--mode", "production"]
+          libraries:
+            # The wheel installs its *base* dependencies only - a `whl:` library spec has no
+            # way to ask for an extra - so every task of this job used to die at `import
+            # mlflow`. These are the `train` and `tabpfn` extras from pyproject.toml,
+            # pinned identically; tests/test_pipeline.py fails if the two lists drift.
+            - whl: ./dist/*.whl
+            - pypi: {package: "mlflow==2.19.0"}
+            - pypi: {package: "deltalake==0.24.0"}
+            - pypi: {package: "names-dataset==3.1.0"}
+            - pypi: {package: "tabpfn-client==0.5.3"}
+            - pypi: {package: "apscheduler==3.11.0"}
+            - pypi: {package: "tabpfn==8.5.0"}
+
+        # 3. Evaluation on the same data, for the researcher log and the comparable
+        #    metrics. Runs after registration so a slow evaluation never delays the
+        #    model reaching the endpoint.
+        - task_key: evaluate
+          depends_on: [{task_key: train_production}]
+          job_cluster_key: training
+          python_wheel_task:
+            package_name: bl_ranking
+            entry_point: bl-train
+            parameters: ["--mode", "train_test"]
+          libraries:
+            # The wheel installs its *base* dependencies only - a `whl:` library spec has no
+            # way to ask for an extra - so every task of this job used to die at `import
+            # mlflow`. These are the `train` and `tabpfn` extras from pyproject.toml,
+            # pinned identically; tests/test_pipeline.py fails if the two lists drift.
+            - whl: ./dist/*.whl
+            - pypi: {package: "mlflow==2.19.0"}
+            - pypi: {package: "deltalake==0.24.0"}
+            - pypi: {package: "names-dataset==3.1.0"}
+            - pypi: {package: "tabpfn-client==0.5.3"}
+            - pypi: {package: "apscheduler==3.11.0"}
+            - pypi: {package: "tabpfn==8.5.0"}
+
+  model_serving_endpoints:
+    bl_brand_ranker:
+      name: "bl-brand-ranker-${bundle.target}"
+      config:
+        served_entities:
+          - name: champion
+            entity_name: "${var.catalog}.${var.schema}.bl_brand_ranker"
+            # An alias rather than a version number, so `make rollback` is a registry
+            # operation rather than a redeploy. Worth being precise about the limit: the
+            # endpoint resolves the alias when the served entity is created or updated, so
+            # a rollback performed purely in the registry needs the endpoint updated
+            # afterwards (`databricks bundle deploy`, or an update-config call) before the
+            # new champion is actually serving. The alias is still the single source of
+            # truth for *which* version that is - nothing here pins a number - but the
+            # claim "move the alias and the endpoint follows on its own" was too strong.
+            entity_version: "@champion"
+            workload_size: Small
+            # Never scale to zero. This endpoint is on the funnel's synchronous path;
+            # a cold start would put the model-load time (seconds) inside a user's
+            # page load.
+            scale_to_zero_enabled: false
+            environment_vars:
+              BL_SERVING__THREADS_PER_WORKER: "1"
+              BL_SERVING__FEATURE_PATH: "fast"
+        traffic_config:
+          routes:
+            - served_model_name: champion
+              traffic_percentage: 100
+        auto_capture_config:
+          # Request/response logging into Delta: the input for drift monitoring and for
+          # replaying production traffic against a challenger.
+          catalog_name: "${var.catalog}"
+          schema_name: "${var.schema}"
+          table_name_prefix: bl_brand_ranker_inference
+          enabled: true

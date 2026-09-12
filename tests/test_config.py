@@ -7,6 +7,8 @@ says which variable did it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from bl_ranking.config import Settings
@@ -113,10 +115,33 @@ def test_a_config_file_that_is_not_a_mapping_says_so(monkeypatch, tmp_path):
         Settings.load()
 
 
-def test_a_missing_config_file_is_still_fine(monkeypatch, tmp_path):
-    """Every setting has a default and the effective config is logged either way."""
-    monkeypatch.setenv("BL_CONFIG", str(tmp_path / "absent.yaml"))
+def test_no_config_file_anywhere_is_still_fine(monkeypatch):
+    """Every setting has a default and the effective config is logged either way.
+
+    Expressed through the *search* rather than through BL_CONFIG, which is the distinction
+    that matters: a path nobody named may be absent, a path somebody named may not. The
+    test used to make that point with BL_CONFIG and so asserted the behaviour that let the
+    Databricks bundle read no config at all in silence.
+    """
+    import bl_ranking.config as config
+
+    monkeypatch.delenv("BL_CONFIG", raising=False)
+    monkeypatch.setattr(config, "_default_config_path",
+                        lambda: Path("/nonexistent/conf/config.yaml"))
     assert Settings.load().serving.port == 8080
+
+
+@pytest.mark.parametrize("channel", ["env", "argument"])
+def test_a_config_file_somebody_named_must_exist(monkeypatch, tmp_path, channel):
+    absent = tmp_path / "absent.yaml"
+    if channel == "env":
+        monkeypatch.setenv("BL_CONFIG", str(absent))
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            Settings.load()
+    else:
+        monkeypatch.delenv("BL_CONFIG", raising=False)
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            Settings.load(config_path=absent)
 
 
 @pytest.mark.parametrize("variable", ["BL_SERVING", "BL_MODEL"])
@@ -195,3 +220,38 @@ def test_a_usable_lookback_window_is_accepted(monkeypatch):
     assert Settings.load().data.lookback_days == 8
     monkeypatch.setenv("BL_DATA__LOOKBACK_DAYS", "")      # unset means the whole table
     assert Settings.load().data.lookback_days is None
+
+
+def test_the_config_file_and_the_code_defaults_agree():
+    """conf/config.yaml restates the dataclass defaults, and the docs call the file the
+    place settings live. That is only true while the two agree - and nothing checked.
+
+    It matters because a missing config file is tolerated: the Databricks bundle pointed
+    BL_CONFIG at a path that was never synced, and for months it made no difference
+    precisely because of this coincidence. If the file ever carries a value the code does
+    not default to, a deployment that fails to read it changes behaviour silently.
+    """
+    import yaml
+
+    from bl_ranking.config import _build
+
+    root = Path(__file__).resolve().parents[1]
+    from_file = yaml.safe_load((root / "conf" / "config.yaml").read_text())
+    with_file = _build(Settings, dict(from_file)).flat()
+    defaults = Settings().flat()
+
+    differing = {k: (defaults[k], with_file[k]) for k in defaults
+                 if defaults[k] != with_file.get(k)}
+    assert not differing, (
+        "conf/config.yaml now differs from the dataclass defaults, so a deployment that "
+        f"cannot read the file behaves differently: {differing}")
+
+
+def test_a_named_config_file_that_is_missing_is_an_error(tmp_path, monkeypatch):
+    """A config file nobody asked for may be absent; one an operator named may not. The
+    Databricks bundle named a file that was never synced to the workspace, and because a
+    missing file was fine everywhere, the weekly job read no config at all and said nothing.
+    """
+    monkeypatch.setenv("BL_CONFIG", str(tmp_path / "not-there.yaml"))
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        Settings.load()

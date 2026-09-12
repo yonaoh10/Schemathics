@@ -19,6 +19,7 @@ upstream or downstream of them changes.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,28 @@ class Snapshot:
         return len(self.frame)
 
 
+# A Unity Catalog table name: three dot-separated parts and no path separator. delta-rs
+# takes a filesystem URI, so a name like this reaches `resolve()` and becomes a *local
+# directory* of that name - the weekly job writing 81k rows into
+# ./main.business_loans.bl_sessions on a cluster's ephemeral disk, reporting success, while
+# the real table never changes. The module docstring has always said that swapping in
+# Databricks means replacing these two functions with spark.read.table; this refuses the
+# configuration that assumes it has already been done.
+_UNITY_CATALOG_NAME = re.compile(r"^[^/\\:.]+\.[^/\\:.]+\.[^/\\:.]+$")
+
+
+def _reject_unity_catalog_name(table_uri: str | Path) -> None:
+    text = str(table_uri).strip()
+    if _UNITY_CATALOG_NAME.match(text):
+        raise ValueError(
+            f"{text!r} looks like a Unity Catalog table name, and this module writes to a "
+            f"filesystem path with delta-rs - it would create a local directory of that "
+            f"name and leave the real table untouched. Point paths.delta_table at a path "
+            f"(a Unity Catalog volume works: /Volumes/<catalog>/<schema>/<volume>/...), or "
+            f"replace read_snapshot/write_snapshot with the Spark equivalents."
+        )
+
+
 def write_snapshot(frame: pd.DataFrame, table_uri: str | Path,
                    mode: str = "overwrite",
                    commit_metadata: dict[str, str] | None = None) -> int:
@@ -56,6 +79,7 @@ def write_snapshot(frame: pd.DataFrame, table_uri: str | Path,
     it is then atomic with the version it describes, and because it works on object
     storage and Unity Catalog - where a local sibling directory would not exist at all.
     """
+    _reject_unity_catalog_name(table_uri)
     path = resolve(table_uri)
     path.parent.mkdir(parents=True, exist_ok=True)
     extra = ({"commit_properties": CommitProperties(custom_metadata=commit_metadata)}
@@ -108,6 +132,7 @@ def _typed_for_delta(frame: pd.DataFrame) -> pd.DataFrame:
 def read_snapshot(table_uri: str | Path, version: int | None = None,
                   lookback_days: int | None = None) -> Snapshot:
     """Read the table (optionally at a past version, optionally windowed by date)."""
+    _reject_unity_catalog_name(table_uri)
     path = resolve(table_uri)
     if not path.exists():
         raise FileNotFoundError(

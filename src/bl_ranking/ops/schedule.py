@@ -19,8 +19,18 @@ parses the same string instead of keeping a second copy in a different dialect.
 
 Locally, `python -m bl_ranking.ops.schedule` runs an APScheduler process that fires
 `training.job.run(train_test=False)` on that schedule. On Databricks the same expression
-goes into the job definition in databricks/databricks.yml and no scheduler process
-exists at all. Both are driven by `schedule.cron`, so they cannot drift apart.
+goes into the job definition in databricks.yml at the repository root, and no scheduler
+process exists at all.
+
+"Both are driven by `schedule.cron`" was too strong: a bundle cannot read our config file,
+so the expression is copied into it by hand. What keeps them together is a test that reads
+both files and fails when either moves - which is the only mechanism available, and worth
+naming rather than implying a shared read that does not exist.
+
+Two Quartz features are refused here rather than translated, because APScheduler cannot
+express them and Databricks can: the calendar tokens L, W and # in day-of-month, and a
+restricted year. Silently dropping either meant the two schedulers fired on different
+days from the same string, which is the one outcome this module exists to prevent.
 """
 
 from __future__ import annotations

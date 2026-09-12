@@ -56,6 +56,9 @@ tabpfn = ["tabpfn==8.5.0"]
 dev = [
   "pytest==8.3.4",
   "ruff==0.8.4",
+  # databricks.yml declares `build: python -m build --wheel` as the way the bundle
+  # produces its artifact, and nothing installed the tool that runs it.
+  "build==1.2.2.post1",
 ]
 
 [tool.setuptools.packages.find]

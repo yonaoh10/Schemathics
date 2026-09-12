@@ -101,7 +101,7 @@ version produced it and whether that backend is bit-identical to TabPFN.
         |            +------------------------+------------------------+
         |            |                                                 |
         |    train_test=True                                   train_test=False
-        |    time split, per-day metrics,                      fit on all data,
+        |    time split, per-day metrics,                    fit on the same rows,
         |    researcher log as artifact                        build the bundle
         |    nothing registered                                       |
         |                                                             v
@@ -120,19 +120,33 @@ version produced it and whether that backend is bit-identical to TabPFN.
 ### Local stack vs Databricks
 
 Everything runs locally, and each local piece has a one-to-one Databricks counterpart.
-`databricks/databricks.yml` is the Asset Bundle that deploys it.
+`databricks.yml` is the Asset Bundle that deploys it, and it sits at the repository root
+because a bundle's sync root is the directory holding it: `conf/config.yaml` and the
+`dist/` wheel both have to be inside.
 
 | Local | Databricks |
 |---|---|
-| `deltalake` (delta-rs) table on disk | Unity Catalog Delta table |
+| `deltalake` (delta-rs) table on disk | the same delta-rs code against a Unity Catalog **volume** path |
 | MLflow server in Docker (sqlite + artifacts) | the workspace tracking server and UC registry |
 | `bl_ranking.training.job` | the three tasks of the `bl_weekly_training` job |
 | APScheduler in the `scheduler` container | the job's `schedule` block |
 | FastAPI container | a Model Serving endpoint fronting the same pyfunc |
 | `models:/bl_brand_ranker@champion` | `catalog.schema.bl_brand_ranker@champion` |
 
-The schedule string lives in `conf/config.yaml` and is read by both, so they cannot
-drift apart. A test asserts that.
+A volume rather than a three-part table name, because `data/delta.py` writes with
+delta-rs and delta-rs takes a filesystem path. A name like
+`main.business_loans.bl_sessions` used to be set here and produced a *local directory* of
+that name on the driver's ephemeral disk: the job reported 81,002 rows ingested and the
+real table never changed. That configuration is now refused outright, naming the
+alternative. Reading through Spark instead would mean replacing `read_snapshot` and
+`write_snapshot`, which is the one substitution the module has always documented.
+
+The schedule string is a hand-copied duplicate — a bundle cannot read our config file —
+so a test pins the two strings together and fails if either moves. Same for the library
+list: the bundle installs the `train` and `tabpfn` extras as explicit pinned `pypi`
+libraries, because a `whl:` spec has no way to ask for an extra, and a test asserts that
+list still matches `pyproject.toml`. Without it every task of the weekly job died at
+`import mlflow`.
 
 ---
 
@@ -387,8 +401,10 @@ Which means no shipped way of starting the API may set that variable by default,
 a while every one of them did - the compose file and `make serve` both pinned
 `catboost_fallback`. The second tier was unreachable in practice: a rollback to a
 surrogate bundle would have been served by the fallback regressor, with a different
-ranking and nothing saying so. Both now leave it unset unless an operator asks
-(`make serve BACKEND=surrogate`, or `BL_PAYOUT_BACKEND` for compose), because a
+ranking and nothing saying so. Both now leave it unset unless an operator asks: `make serve BACKEND=surrogate`, or
+`BL_SERVING_PAYOUT_BACKEND` for compose — a *different* variable from the
+`BL_PAYOUT_BACKEND` the training services read, because `.env.example` fills that one in
+and sharing it would silence the bundle again the moment anyone copied the example. A
 precedence rule no deployment can reach is documentation, not behaviour.
 
 Two smaller things worth knowing: TabPFN sends usage telemetry to a third party by

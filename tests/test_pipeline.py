@@ -221,16 +221,6 @@ def test_non_quartz_expressions_are_rejected(expression):
         parse_quartz(expression)
 
 
-def test_local_and_databricks_schedules_are_the_same_string():
-    import yaml
-
-    bundle_path = Path(__file__).resolve().parents[1] / "databricks" / "databricks.yml"
-    spec = yaml.safe_load(bundle_path.read_text())
-    job = spec["resources"]["jobs"]["bl_weekly_training"]
-    assert job["schedule"]["quartz_cron_expression"] == Settings.load().schedule.cron
-    assert job["schedule"]["timezone_id"] == Settings.load().schedule.timezone
-
-
 # --------------------------------------------------------------------------------- #
 # Bundle and registry
 # --------------------------------------------------------------------------------- #
@@ -1742,3 +1732,137 @@ def test_the_gate_reports_both_timestamp_counters():
         rows=2, session_dt=["06/01/2026 08:00:00", "07/01/2026 08:00:00"]))
     assert repairs["timestamp_ambiguous_layout"] == 2
     assert repairs["timestamp_format_fallbacks"] == 0      # the column is self-consistent
+
+
+# --------------------------------------------------------------------------------- #
+# The Databricks bundle: every value it duplicates from the repository
+# --------------------------------------------------------------------------------- #
+
+def _bundle() -> dict:
+    import yaml
+
+    path = Path(__file__).resolve().parents[1] / "databricks.yml"
+    assert path.exists(), "databricks.yml must be at the repository root: a bundle's sync " \
+                          "root is the directory holding it, and conf/ and dist/ have to " \
+                          "be inside it"
+    return yaml.safe_load(path.read_text())
+
+
+def _shipped_config() -> dict:
+    """conf/config.yaml as written, not as the environment overrides it.
+
+    What the bundle duplicates is the *file*. `Settings.load()` here would merge this test
+    session's own BL_ variables (conftest pins the payout backend for CI), so comparing
+    against it would compare the bundle to the test harness.
+    """
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    return yaml.safe_load((root / "conf" / "config.yaml").read_text())
+
+
+def test_the_bundle_and_the_config_schedule_at_the_same_moment():
+    """A bundle cannot read conf/config.yaml, so the Quartz string is copied into it by
+    hand. The README claimed the two were one definition read twice; they are two, and the
+    only way to keep that claim true is to fail here when either moves."""
+    job = _bundle()["resources"]["jobs"]["bl_weekly_training"]
+    schedule = _shipped_config()["schedule"]
+    assert job["schedule"]["quartz_cron_expression"] == schedule["cron"]
+    assert job["schedule"]["timezone_id"] == schedule["timezone"]
+
+
+def test_the_bundle_installs_the_extras_the_tasks_import():
+    """A `whl:` library spec installs the wheel's base dependencies and has no way to ask
+    for an extra, so every task of the weekly job died at `import mlflow`. The extras are
+    listed as explicit pinned pypi libraries instead, which only works while the two lists
+    agree."""
+    import tomllib
+
+    root = Path(__file__).resolve().parents[1]
+    extras = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"]
+    expected = set(extras["train"]) | set(extras["tabpfn"])
+
+    for task in _bundle()["resources"]["jobs"]["bl_weekly_training"]["tasks"]:
+        libraries = task["libraries"]
+        assert {"whl": "./dist/*.whl"} in libraries, task["task_key"]
+        installed = {entry["pypi"]["package"] for entry in libraries if "pypi" in entry}
+        assert installed == expected, task["task_key"]
+
+
+def test_the_bundle_points_delta_at_a_path_not_a_table_name():
+    """delta-rs takes a filesystem path. A three-part Unity Catalog name produced a local
+    directory of that name on the driver's ephemeral disk - 81k rows ingested, the real
+    table untouched - so data/delta.py now refuses one, and the bundle must not set one."""
+    from bl_ranking.data.delta import _reject_unity_catalog_name
+
+    env = (_bundle()["resources"]["jobs"]["bl_weekly_training"]["job_clusters"][0]
+           ["new_cluster"]["spark_env_vars"])
+    _reject_unity_catalog_name(env["BL_PATHS__DELTA_TABLE"])       # raises if it is a name
+    assert env["BL_PATHS__DELTA_TABLE"].startswith("/Volumes/")
+    # And the ingest task needs somewhere to read from.
+    assert env["BL_PATHS__RAW_DIR"].startswith("/Volumes/")
+    # Both URIs, not just the registry: without the tracking URI every run logged to the
+    # driver's ephemeral disk and vanished with the cluster.
+    assert env["MLFLOW_TRACKING_URI"] == "databricks"
+    assert env["MLFLOW_REGISTRY_URI"] == "databricks-uc"
+
+
+def test_the_bundle_default_backend_matches_the_config():
+    """It said tabpfn_local, which contradicted conf/config.yaml and the README's own
+    latency argument - and needed a torch extra the library spec could not install."""
+    assert (_bundle()["variables"]["payout_backend"]["default"]
+            == _shipped_config()["model"]["payout"]["backend"])
+
+
+def test_the_bundle_declares_a_real_single_node_cluster():
+    """num_workers: 0 on its own is what the Databricks CLI's validator calls a
+    misconfigured single-node cluster."""
+    cluster = (_bundle()["resources"]["jobs"]["bl_weekly_training"]["job_clusters"][0]
+               ["new_cluster"])
+    assert cluster["num_workers"] == 0
+    assert cluster["spark_conf"]["spark.databricks.cluster.profile"] == "singleNode"
+    assert cluster["custom_tags"]["ResourceClass"] == "SingleNode"
+
+
+def test_the_bundle_can_build_its_own_artifact():
+    """databricks.yml declares `python -m build --wheel` as how the wheel is produced, and
+    nothing installed the tool that runs it - so a first `databricks bundle deploy` failed
+    on a missing artifact with no hint about what to install."""
+    import tomllib
+
+    root = Path(__file__).resolve().parents[1]
+    dev = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"]["dev"]
+    command = _bundle()["artifacts"]["bl_ranking_wheel"]["build"]
+
+    assert command == "python -m build --wheel"
+    assert any(pin.startswith("build==") for pin in dev), dev
+    # And the artifact path has to be inside the sync root, which is this file's directory.
+    assert _bundle()["artifacts"]["bl_ranking_wheel"]["path"] == "."
+
+
+def test_no_shipped_launcher_pins_the_serving_backend():
+    """Serving reads the backend from the bundle it loaded unless an operator asks for
+    another, which is what lets a rollback carry the backend its version was trained with.
+    Every shipped way of starting the API used to pin it, so that tier was unreachable in
+    practice - and the fix only holds while the API's variable stays separate from the one
+    .env.example fills in for training."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    compose = yaml.safe_load((root / "docker" / "docker-compose.yml").read_text())
+    api = compose["services"]["api"]["environment"]["BL_MODEL__PAYOUT__BACKEND"]
+
+    # No default after ':-', so an operator who sets nothing sends an empty value, which
+    # config.env_override_keys treats as unset.
+    assert api.endswith(":-}"), api
+    assert "BL_PAYOUT_BACKEND" not in api, (
+        "the API must not share the training services' variable: .env.example gives that "
+        "one a value, which would pin the serving backend again")
+
+    makefile = (root / "Makefile").read_text()
+    serve_target = makefile.split("\nserve:", 1)[1].split("\n\n", 1)[0]
+    assert "origin BACKEND" in serve_target, (
+        "make serve must pass BACKEND through only when it was asked for on the command "
+        f"line, got: {serve_target!r}")
