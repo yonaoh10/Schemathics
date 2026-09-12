@@ -46,6 +46,17 @@ ARTIFACT_NAME = "gender_lookup.parquet"
 KEY_SCHEME = b"capitalised-lookup-key-v1"
 KEY_SCHEME_FIELD = b"bl_key_scheme"
 
+# The row count the builder wrote, stamped beside the key scheme. A truncated parquet - a
+# write interrupted, a partial copy, a file assembled by another tool - has the right
+# columns and the right dtypes and answers 'unknown' for almost every name. Comparing the
+# count against the file is exact, and needs no arbitrary "too small" threshold.
+ROW_COUNT_FIELD = b"bl_rows"
+
+# What _detect can return. A table whose gender column holds anything else was not written
+# by build(): the likeliest cause is name and gender swapped, which loads cleanly, resolves
+# every name to 'unknown', and leaves GET /model reporting a healthy 'precomputed'.
+GENDER_VALUES = frozenset({"male", "female", "unknown"})
+
 # What the research code returns when the dataset has no usable entry for a name.
 UNKNOWN: tuple[str, float] = ("unknown", 0.0)
 
@@ -115,6 +126,22 @@ class GenderLookup:
                 f"{path} has {table.column('name').null_count} null name key(s); the "
                 f"lookup would never match them."
             )
+        metadata = table.schema.metadata or {}
+        recorded = metadata.get(ROW_COUNT_FIELD)
+        if recorded is not None and int(recorded) != table.num_rows:
+            raise ValueError(
+                f"{path} is truncated: the builder wrote {int(recorded):,} names and the "
+                f"file holds {table.num_rows:,}. A short table has the right columns and "
+                f"the right dtypes and answers 'unknown' for everything it lost."
+            )
+        genders = _distinct_genders(table)
+        if not genders <= GENDER_VALUES:
+            raise ValueError(
+                f"{path} has gender value(s) {sorted(genders - GENDER_VALUES)[:5]}, which "
+                f"the research code's detect_gender_with_confidence never returns. The "
+                f"likeliest cause is name and gender the wrong way round, which would "
+                f"load cleanly and resolve every name to 'unknown'."
+            )
         current = _warn_if_stale(table, path)
         names = table.column("name").to_pylist()
         genders = table.column("gender").to_pylist()
@@ -172,11 +199,30 @@ class GenderLookup:
                 # has to be exact.
                 "confidence": pa.array(confidences, type=pa.float64()),
             })
-            table = table.replace_schema_metadata({KEY_SCHEME_FIELD: KEY_SCHEME})
+            table = table.replace_schema_metadata({
+                KEY_SCHEME_FIELD: KEY_SCHEME,
+                ROW_COUNT_FIELD: str(len(names)).encode(),
+            })
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             pq.write_table(table, str(path), compression="zstd")
 
         return cls(dict(zip(names, zip(genders, confidences, strict=False), strict=False)))
+
+
+def _distinct_genders(table) -> set[str]:
+    """The distinct values in the gender column, read from the dictionary where there is one.
+
+    `build` dictionary-encodes that column - two values across 714k rows - so this costs
+    microseconds. Materialising it with `to_pylist` cost 1.7 s of a 5 s load, which is far
+    too much to spend on a check.
+    """
+    column = table.column("gender")
+    if pa.types.is_dictionary(column.type):
+        values: set[str] = set()
+        for chunk in column.chunks:
+            values |= set(chunk.dictionary.to_pylist())
+        return values - {None}
+    return set(column.to_pylist()) - {None}
 
 
 def _loaded_dataset():

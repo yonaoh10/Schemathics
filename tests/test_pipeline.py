@@ -36,15 +36,45 @@ def test_flat_view_covers_every_nested_key():
 
 def test_research_hyperparameters_match_the_research_code():
     """conf/config.yaml is logged to MLflow as the run's parameters; if it drifts from
-    what bl_models_train.py actually uses, every comparison becomes a lie."""
+    what bl_models_train.py actually uses, every comparison becomes a lie.
+
+    Checked through the same function the training job calls, so the test and the run
+    cannot disagree about what counts as drift."""
+    from bl_ranking.training.job import assert_config_mirrors_research
+
+    assert_config_mirrors_research(Settings.load())
     source = (Path(__file__).resolve().parents[1]
               / "src/bl_ranking/research/bl_models_train.py").read_text()
-    catboost = Settings.load().model.catboost
-    assert f"depth={catboost.depth}" in source
-    assert f"n_estimators={catboost.n_estimators}" in source
-    assert f"random_seed={catboost.random_seed}" in source
-    assert f"eval_metric='{catboost.eval_metric}'" in source
+    # context_size is deliberately not in that function: the trainer overrides
+    # tabpfn_regression_payout and really does apply it, so it is a control rather than
+    # a mirror. It still has to start life matching the research default.
     assert f"CONTEXT_SIZE = {Settings.load().model.payout.context_size}" in source
+
+
+@pytest.mark.parametrize(("setting", "value"), [
+    ("model.catboost.depth", 2),
+    ("model.catboost.n_estimators", 50),
+    ("model.catboost.random_seed", 7),
+    ("model.catboost.eval_metric", "Logloss"),
+    ("data.days_for_test", 14),
+])
+def test_a_hyperparameter_that_cannot_be_applied_cannot_be_claimed(setting, value):
+    """These settings mirror values the research scripts hard-code, and the brief forbids
+    editing those - so nothing reads them back into the model. `BL_MODEL__CATBOOST__DEPTH=2`
+    used to produce a run whose params said depth 2 while the shipped classifier had depth
+    8, and the registered version's tags said so too. A researcher sweeping depth would
+    have compared two identical models and drawn a conclusion from the noise."""
+    from bl_ranking.training.job import assert_config_mirrors_research
+
+    settings = Settings.load()
+    target = settings
+    *path, leaf = setting.split(".")
+    for part in path:
+        target = getattr(target, part)
+    setattr(target, leaf, value)
+
+    with pytest.raises(ValueError, match=setting):
+        assert_config_mirrors_research(settings)
 
 
 # --------------------------------------------------------------------------------- #
@@ -728,6 +758,10 @@ def _gate_frame(rows=3, **override):
         "session_dt": ["2026-01-06 19:24:22"] * rows,
         "conversion_dt": [None] * rows,
         "register_date": [None] * rows,
+        # additional_features takes .str.len() of both, so the gate has an invariant for
+        # them and a frame without them is not a realistic extract.
+        "fname": ["Rigoberto"] * rows,
+        "lname": ["Rodriguez"] * rows,
         **{c: ["x"] * rows for c in survey},
     })
     for column, values in override.items():
@@ -1152,14 +1186,43 @@ def test_an_id_with_a_leading_zero_survives_the_staged_csv(tmp_path):
     assert [_as_identifier(v) for v in ("007", 7448788, "12")] == research_levels
 
 
-def test_an_id_the_round_trip_would_change_stops_the_run(tmp_path):
+@pytest.mark.parametrize("ids", [
+    # A fractional id is left exactly as it came - truncating '7.5' to '7' would silently
+    # change it - and pandas then reads the column as float64, so its neighbour '12' comes
+    # back as '12.0'. A level no request can ever match.
+    ["7.5", "12"],
+    # The literal text 'nan' in a CSV cell reads back as a null, which the research code's
+    # own fillna turns into 'Other'.
+    ["nan", "12"],
+])
+def test_an_id_the_round_trip_would_change_stops_the_run(tmp_path, ids):
     """Canonicalising covers the ids that occur; the check covers the ones that do not.
-    '1e5' is read back as 100000.0, which is a level no request can ever match."""
+    Two rules are cheaper to maintain than one rule that has to be exhaustive."""
     from bl_ranking.data.ingest import sanitise, stage_for_research_code
 
-    clean, _ = sanitise(_gate_frame(rows=2, sub1=["1e5", "7"]))
+    clean, _ = sanitise(_gate_frame(rows=2, sub1=ids))
     with pytest.raises(ValueError, match="round trip"):
         stage_for_research_code(clean, tmp_path / "input")
+
+
+@pytest.mark.parametrize(("spelling", "canonical"), [
+    ("007", "7"), ("7.0", "7"),
+    # These two survived the gate untouched and then stopped the weekly retrain at the
+    # round-trip check, because only a single trailing '.0' was handled. A SQL DECIMAL or
+    # float column exports both.
+    ("7448788.00", "7448788"), ("1e3", "1000"),
+    ("1.2e17", "120000000000000000"),
+    # Not a whole number, and not changed: truncating an id is worse than refusing it.
+    ("7.5", "7.5"),
+    # Numeric-looking but not numbers.
+    ("nan", "nan"), ("Inf", "Inf"), ("abc007", "abc007"),
+    # Past int64, so exact only if it is never parsed as a number.
+    ("12345678901234567890", "12345678901234567890"),
+])
+def test_every_numeric_id_spelling_lands_on_one_level(spelling, canonical):
+    from bl_ranking.data.ingest import _as_identifier
+
+    assert _as_identifier(spelling) == canonical
 
 
 def test_the_ingest_report_reaches_the_training_run(tmp_path):
@@ -1476,3 +1539,206 @@ def test_a_windows_drive_letter_is_a_directory_not_a_registry(settings, monkeypa
     monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
     monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
     assert _registry_is_authoritative(settings) is False
+
+
+def test_the_run_reports_the_rows_it_actually_fitted(tmp_path):
+    """The research code calls split_by_time in BOTH modes, so the fit never sees the last
+    7 days of the window - production included. The manifest reported len(snapshot) as
+    rows_train, which overstated it by about a tenth on the real extract, and the docs
+    called production mode "fit on everything". The split is observed, not changed."""
+    import numpy as np
+
+    from bl_ranking.training.trainer import ProductionTrainer
+
+    frame = pd.DataFrame({
+        "session_dt": pd.to_datetime("2026-01-01") + pd.to_timedelta(np.arange(30), "D"),
+        "payout": np.arange(30, dtype=float),
+    })
+    trainer = ProductionTrainer.__new__(ProductionTrainer)   # no research I/O needed
+    trainer.split_counts = {}
+    train, test = ProductionTrainer.split_by_time(trainer, frame.copy(), 7)
+
+    assert trainer.split_counts == {
+        "rows_preprocessed": 30, "rows_fitted": 23, "rows_held_out": 7,
+        "days_for_test": 7,
+    }
+    assert len(train) == 23 and len(test) == 7
+    # And the counts are the split, not the snapshot: the two differ by the held-out tail.
+    assert trainer.split_counts["rows_fitted"] < trainer.split_counts["rows_preprocessed"]
+
+
+def test_the_research_logger_takeover_is_actually_undone(tmp_path, monkeypatch):
+    """preserve_root_logging has to be entered before the trainer is *constructed*:
+    setup_bl_logger runs in BLPayoutModelsFit.__init__. Entered after, it saved the
+    already-cleared handler list and restored that - so the scheduler went permanently
+    mute after its first retrain, including the line naming the version it registered."""
+    import logging
+
+    from bl_ranking.training.trainer import preserve_root_logging
+
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    marker = logging.NullHandler()
+    root.addHandler(marker)
+    try:
+        with preserve_root_logging():
+            # What setup_bl_logger does, inside the guard as the job now arranges.
+            root.handlers.clear()
+            root.addHandler(logging.NullHandler())
+        assert marker in root.handlers, "the process's own handler must come back"
+    finally:
+        root.handlers = saved
+
+
+def test_a_payout_column_with_no_numbers_is_refused():
+    """It cannot be repaired into a usable one and it fails a long way from the gate: every
+    repair counter reports zero, _typed_for_delta types the all-null column as *string* so
+    the table's schema silently changes, and the run dies half an hour later inside
+    CatBoost with "Labels variable is empty" - naming neither the column nor the extract."""
+    from bl_ranking.data.ingest import sanitise
+
+    with pytest.raises(ValueError, match="payout arrived with no numeric values"):
+        sanitise(_gate_frame(rows=3, payout=[None, None, None]))
+
+    # All-zero is a real answer, not a missing column: nobody was paid that day.
+    clean, _ = sanitise(_gate_frame(rows=3, payout=[0.0, 0.0, 0.0]))
+    assert pd.api.types.is_numeric_dtype(clean["payout"])
+
+
+def test_run_directories_are_stamped_in_utc_and_never_reused(tmp_path):
+    """The name is also an ordering - serving's offline fallback picks the newest
+    runs/*/bundle by sorting these. A DST fall-back repeats an hour, so two retrains could
+    land on the same second-resolution local name, and exist_ok=True wrote the second run's
+    artifacts into the first's directory."""
+    from bl_ranking.training.job import _new_run_dir
+
+    settings = Settings.load()
+    settings.paths.run_root = str(tmp_path)
+
+    first = _new_run_dir(settings, "production")
+    second = _new_run_dir(settings, "production")
+
+    assert first != second
+    assert first.name.split("_")[2].endswith("Z"), first.name
+    # Sorting the names has to order them by time, which is what the fallback relied on -
+    # and is exactly what a '-1' collision suffix broke, because '-' precedes '_'.
+    assert sorted([first.name, second.name]) == [first.name, second.name]
+
+
+def test_a_delta_version_that_does_not_exist_says_which_ones_do(tmp_path):
+    """delta-rs answers a missing version with a generic error, and a negative one by
+    saying the table was not found - for a table that plainly is."""
+    from bl_ranking.data.delta import read_snapshot, write_snapshot
+
+    table = tmp_path / "delta" / "t"
+    write_snapshot(pd.DataFrame({"session_dt": ["2026-01-01 10:00:00"]}), table)
+    with pytest.raises(ValueError, match="has no version 7; versions 0..0"):
+        read_snapshot(table, version=7)
+
+
+def test_the_local_fallback_picks_the_newest_bundle_by_its_manifest(tmp_path):
+    """Ordered by each bundle's own trained_at, not by directory name. The names are UTC
+    now and sort correctly, but only for bundles this version produced - an earlier one
+    stamped them in local time, so a container whose TZ moved backwards made the newest
+    bundle stop being the last name alphabetically."""
+    from bl_ranking.serving.model_source import _latest_local_bundle
+
+    settings = Settings.load()
+    settings.paths.run_root = str(tmp_path)
+    # Deliberately named so that the *older* run sorts last, as a backwards TZ change did.
+    for name, trained_at in (("20260301_010000_production", "2026-03-01T09:00:00Z"),
+                             ("20260301_020000_production", "2026-03-01T08:00:00Z")):
+        bundle = tmp_path / name / "bundle"
+        bundle.mkdir(parents=True)
+        bundle_files.Manifest(trained_at=trained_at).write(bundle)
+
+    chosen = _latest_local_bundle(settings)
+    assert chosen.parent.name == "20260301_010000_production"
+
+
+@pytest.mark.parametrize("header", ["Payout", "payout "])
+def test_a_header_that_only_looks_different_is_refused(header):
+    """pandas keeps 'payout' and 'Payout' as two distinct columns, so neither the
+    missing-column check nor the mangled-duplicate check sees anything wrong - and the gate
+    then reads whichever copy is spelled exactly right, which in a warehouse view exporting
+    both a snake_case and a display-cased column is as likely as not the empty one.
+    Trailing whitespace in a header is something CSV exporters do routinely."""
+    from bl_ranking.data.ingest import REQUIRED_COLUMNS, _require_columns
+
+    frame = pd.DataFrame({c: ["x"] for c in REQUIRED_COLUMNS})
+    frame[header] = ["42.5"]
+    with pytest.raises(ValueError, match="case or whitespace"):
+        _require_columns(frame)
+
+
+@pytest.mark.parametrize(("names", "fragment"), [
+    # Both differ from the sentinel only in spelling, and nothing downstream treats them
+    # as the sentinel - so each would be offered to the funnel as a lender by that name.
+    (["acme", "Other"], "case or whitespace"),
+    (["acme", "other "], "case or whitespace"),
+    (["other"], "empty brand universe"),
+])
+def test_a_brand_that_is_the_sentinel_in_all_but_spelling_is_refused(tmp_path, names, fragment):
+    from bl_ranking.serving.ranker import _assert_usable_brand_universe
+
+    with pytest.raises(ValueError, match=fragment):
+        _assert_usable_brand_universe(pd.DataFrame({"client_name": names}), tmp_path)
+
+    # And a real universe is still fine, sentinel included.
+    _assert_usable_brand_universe(
+        pd.DataFrame({"client_name": ["acme", "beta", "other"]}), tmp_path)
+
+
+def test_a_name_column_the_research_code_cannot_read_is_refused():
+    """additional_features calls `.str.len()` on fname and lname (bl_models_train.py lines
+    209-210), and the gate had no invariant for either - so a numeric or fully redacted name
+    column passed with every counter at zero and killed the run inside the vendored code."""
+    from bl_ranking.data.ingest import sanitise
+
+    clean, repairs = sanitise(_gate_frame(rows=3, fname=["John", 7, "Ann"],
+                                          lname=["Smith"] * 3))
+    assert repairs["name_nonstring"] == 1
+    clean["fname"].str.len()                       # the invariant itself, unassisted
+
+    with pytest.raises(ValueError, match="fname"):
+        sanitise(_gate_frame(rows=3, fname=[None] * 3, lname=["Smith"] * 3))
+
+
+def test_a_text_invariant_is_checked_on_the_rows_that_survive():
+    """Evaluated before the no-session_dt drop, a column whose only text sat on rows the
+    gate was about to discard satisfied it - and the research code died on .str.lower()
+    anyway."""
+    from bl_ranking.data.ingest import sanitise
+
+    with pytest.raises(ValueError, match="industry"):
+        sanitise(_gate_frame(
+            rows=4,
+            industry=[None, "retail", "retail", "retail"],
+            session_dt=["2026-01-01 10:00:00", "nope", "nope", "nope"]))
+
+
+@pytest.mark.parametrize(("dates", "ambiguous"), [
+    (["2026-01-06 19:24:22", "2026-01-07 10:00:00"], 0),      # ISO: never ambiguous
+    (["06/01/2026 08:00:00", "07/01/2026 08:00:00"], 2),      # could be either way round
+    (["13/01/2026", "25/01/2026"], 0),                        # 13 cannot be a month
+    (["06/06/2026"], 0),                                      # reads the same both ways
+    (["2026/01/06"], 0),                                      # four-digit year first
+])
+def test_an_ambiguous_date_layout_is_counted(dates, ambiguous):
+    """timestamp_format_fallbacks counts a row whose layout differs from its column's,
+    which is the case pandas notices. It reports 0 for the documented failure it was named
+    for - a whole column written DD/MM/YYYY, which inference reads as MM/DD with nothing
+    looking unusual. This counts the rows where the reading is a coin flip, so the
+    ambiguity is visible in the run's parameters instead of resolved silently."""
+    from bl_ranking.data.ingest import _count_ambiguous_dates
+
+    assert _count_ambiguous_dates(pd.Series(dates, dtype="object")) == ambiguous
+
+
+def test_the_gate_reports_both_timestamp_counters():
+    from bl_ranking.data.ingest import sanitise
+
+    _, repairs = sanitise(_gate_frame(
+        rows=2, session_dt=["06/01/2026 08:00:00", "07/01/2026 08:00:00"]))
+    assert repairs["timestamp_ambiguous_layout"] == 2
+    assert repairs["timestamp_format_fallbacks"] == 0      # the column is self-consistent

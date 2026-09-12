@@ -191,8 +191,14 @@ class BrandRanker:
 
         Checking up front turns that into one explicit refusal, identical on both
         paths, which the API renders as a 422.
+
+        register_date is checked in the same place and for a sharper version of the same
+        reason: the research path raises a bare `Exception` for it (import_preprocess
+        line 67, verbatim research code), which `except MissingRegisterDate` in the
+        endpoint cannot catch - so the documented 422 came back as a 500 on that path.
         """
         fast_features.require_survey_answers(user)
+        fast_features.require_register_date(user)
         if self.feature_path == "research":
             return self._rank_via_research_pipeline(user)
         return self._rank_fast(user)
@@ -346,13 +352,32 @@ def _assert_usable_brand_universe(all_clients: pd.DataFrame, directory: Path) ->
             f"lender literally called 'nan'."
         )
 
-    usable = names.astype(str).str.strip()
-    # The sentinel is not a lender, and every other part of serving already knows that:
-    # WarmModels.n_brands and BrandRanker._brands both drop it. Counting it here was
-    # what let a clients file of nothing but 'other' pass the guard, report n_brands 0,
-    # and answer every request 200 with an empty ranking while /readyz stayed green -
-    # the exact outage this function exists to refuse.
-    rankable = usable[usable != bundle_files.OTHER_BRAND]
+    text = names.astype(str)
+
+    # A name that is the sentinel in everything but spelling is refused, because nothing
+    # downstream will treat it as one. The research code drops exactly `!= 'other'`
+    # (bl_exp_payout_predictor.py line 70) and so do WarmModels.n_brands and
+    # BrandRanker._brands, so 'Other' or 'other ' is a *brand* to all three - offered to
+    # the funnel as a lender by that name, at rank 1 if it scores there. Re-mapping it
+    # here would change the data the research pipeline was fitted on; refusing at load
+    # says so instead, where an operator can fix the extract.
+    sentinel = bundle_files.OTHER_BRAND
+    lookalike = text[(text.str.strip().str.casefold() == sentinel) & (text != sentinel)]
+    if len(lookalike):
+        raise ValueError(
+            f"Model bundle at {directory}: {bundle_files.CLIENTS_FILE} lists "
+            f"{sorted(set(lookalike))[:5]}, which differ from the {sentinel!r} "
+            f"no-brand marker only in case or whitespace. Nothing treats those as the "
+            f"marker, so they would be served to the funnel as lenders by that name."
+        )
+
+    # Compared exactly, as BrandRanker._brands compares it, so this counts the same thing
+    # the endpoint ranks. Counting the sentinel as a brand was what let a clients file of
+    # nothing but 'other' pass the guard, report n_brands 0, and answer every request 200
+    # with an empty ranking while /readyz stayed green - the outage this function exists
+    # to refuse.
+    usable = text
+    rankable = usable[usable != sentinel]
     if rankable.empty:
         raise ValueError(
             f"Model bundle at {directory} has an empty brand universe "

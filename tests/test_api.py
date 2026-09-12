@@ -111,10 +111,28 @@ def test_sparse_survey_gives_422_with_an_empty_ranking(client, example_user):
     assert response.json()["detail"]["error"] == "insufficient_survey_answers"
 
 
-def test_missing_register_date_is_a_422(client, example_user):
-    user = dict(example_user)
-    user.pop("register_date")
-    assert client.post("/rank", json=user).status_code == 422
+@pytest.mark.parametrize("mangle", [
+    lambda user: {k: v for k, v in user.items() if k != "register_date"},
+    lambda user: {**user, "register_date": None},
+])
+def test_a_user_who_cannot_be_a_lead_is_told_why(client, example_user, mangle):
+    """The documented 422 carries `register_date_absent`, and for a long time no request
+    could produce it: the field was required, so every such payload came back as a
+    generic validation failure instead - which tells a funnel nothing about why."""
+    response = client.post("/rank", json=mangle(example_user))
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "register_date_absent"
+
+
+def test_a_malformed_register_date_is_not_an_absent_one(client, example_user):
+    """Absent is a data condition; unreadable is a formatting problem. Folding the second
+    into the first would tell the caller they have a user who cannot be a lead when what
+    they have is a broken date format."""
+    response = client.post("/rank", json={**example_user, "register_date": "not a date"})
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert isinstance(detail, list)                      # a validation error, not ours
+    assert "parseable timestamp" in detail[0]["msg"]
 
 
 def test_unknown_fields_are_ignored(client, example_user):
@@ -357,3 +375,43 @@ def test_one_phone_number_gives_one_prefix(example_user, spelling, expected):
 def test_a_17_digit_campaign_id_stays_exact(example_user, spelling):
     assert RankRequest.model_validate(
         {**example_user, "campaign_id": spelling}).campaign_id == 120227360861540306
+
+
+def test_both_endpoints_label_the_same_refusal_the_same_way(client, example_user):
+    """/rank/bare folded a missing register_date into insufficient_data, so an operator
+    reading no_register_date saw /rank traffic only - and could not tell a funnel that
+    had stopped sending register_date from one asking too few survey questions."""
+    from bl_ranking.serving.app import REQUESTS
+
+    payload = {k: v for k, v in example_user.items() if k != "register_date"}
+    before = REQUESTS.labels("no_register_date")._value.get()
+    for path in ("/rank", "/rank/bare"):
+        assert client.post(path, json=payload).status_code == 422
+    assert REQUESTS.labels("no_register_date")._value.get() == before + 2
+
+
+@pytest.mark.parametrize("field", ["session_dt", "register_date", "conversion_dt"])
+@pytest.mark.parametrize("value", [20260115, 20260115.0, 1767225600])
+def test_a_numeric_timestamp_is_refused_at_the_door(client, example_user, field, value):
+    """The ingestion gate refuses a numeric date column; the endpoint used to accept one and
+    serve a ranking built from 1970-01-01. pandas reads a number here as nanoseconds since
+    the epoch, and the epoch is the floor of the accepted range - so session_day,
+    session_day_of_week, session_hour and from_start_to_register were all confidently wrong
+    behind a 200."""
+    response = client.post("/rank", json={**example_user, field: value})
+    assert response.status_code == 422
+    assert "nanoseconds" in str(response.json()["detail"])
+
+
+def test_the_model_endpoint_says_where_its_bundle_came_from(client):
+    """A worker that fell back to a local run directory is healthy by every other measure,
+    and the commonest cause is a mistyped registered model or alias - which looks identical
+    to a registry with nothing promoted yet."""
+    from bl_ranking.serving.model_source import (
+        BUNDLE_SOURCE_LOCAL,
+        BUNDLE_SOURCE_PINNED,
+        BUNDLE_SOURCE_REGISTRY,
+    )
+
+    source = client.get("/model").json()["bundle_source"]
+    assert source in {BUNDLE_SOURCE_LOCAL, BUNDLE_SOURCE_PINNED, BUNDLE_SOURCE_REGISTRY}

@@ -53,7 +53,13 @@ class RankRequest(BaseModel):
 
     session_dt: str
     conversion_dt: str | None = None
-    register_date: str = Field(
+    # Optional, because "absent" is a documented answer rather than a bad request: a
+    # user who never submitted the survey cannot become a lead, and the endpoint says so
+    # with a 422 carrying `register_date_absent`. While the field was required, that
+    # documented error was unreachable - every such payload came back as a generic
+    # validation failure instead, which tells a funnel nothing about why.
+    register_date: str | None = Field(
+        default=None,
         description="Survey submission time. A user without one cannot become a lead."
     )
     campaign_id: int | str
@@ -100,7 +106,12 @@ class RankRequest(BaseModel):
         """
         if not isinstance(data, dict):
             return data
-        for key, value in data.items():
+        # Only the fields this model reads. `extra="ignore"` means the real warehouse
+        # record's other columns - address, business_name, client_id, vertical - are
+        # discarded before anything touches them, so scanning those turned a valid
+        # 22-field request into a 422 over a value nothing would ever have encoded.
+        for key in cls.model_fields:
+            value = data.get(key)
             if not isinstance(value, str):
                 continue
             try:
@@ -112,7 +123,7 @@ class RankRequest(BaseModel):
                 ) from exc
         return data
 
-    @field_validator("session_dt", "register_date", mode="before")
+    @field_validator("session_dt", mode="before")
     @classmethod
     def normalise_required_timestamp(cls, value: Any) -> str:
         """Reject what the pipeline cannot use, and make offsets explicit.
@@ -134,6 +145,20 @@ class RankRequest(BaseModel):
         here is a systematic shift rather than an error - if the funnel logs local
         time instead, change this one function.
         """
+        return _normalise_timestamp(value, required=True)
+
+    @field_validator("register_date", mode="before")
+    @classmethod
+    def normalise_register_date(cls, value: Any) -> str | None:
+        """Absent is a data condition; malformed is a bad request.
+
+        None passes through, and `rank` then refuses the user with the documented
+        `register_date_absent`. A value that is present and unreadable is a formatting
+        problem, and folding it into "absent" would tell the caller their funnel has a
+        user who cannot be a lead when what it has is a broken date format.
+        """
+        if value is None:
+            return None
         return _normalise_timestamp(value, required=True)
 
     @field_validator("conversion_dt", mode="before")
@@ -202,18 +227,13 @@ class RankRequest(BaseModel):
         if value is None:
             return 0
         # A JSON caller has no integers: {"cellphone": 13055550142} and
-        # {"cellphone": 13055550142.0} are the same payload to a browser. str() renders
-        # the second as '13055550142.0', whose digits are '130555501420' - twelve, so
-        # the country-code strip below does not fire and the prefix feature becomes
-        # '130' where the same number as an int gives '305'. Same user, same phone,
-        # different ranking. Rendering a whole-number float as its integer closes that.
-        #
-        # Only a whole number is rewritten. A fractional value is left to the digit
-        # strip, which is what the ingestion gate does with the same text in a CSV cell,
-        # so the two sides still agree on input that is junk to begin with.
-        if isinstance(value, float) and value.is_integer():
-            value = int(value)
-        digits = _NON_DIGITS.sub("", str(value))
+        # {"cellphone": 13055550142.0} are the same payload to a browser, and a
+        # float-typed warehouse column writes the same number as the text
+        # '13055550142.0'. All three have to give one phone number, so the trailing '.0'
+        # comes off with the gate's own rule - imported, not restated, because this is
+        # precisely where the two sides last drifted apart.
+        from bl_ranking.data.ingest import _without_float_suffix
+        digits = _NON_DIGITS.sub("", _without_float_suffix(str(value)))
         if len(digits) == 11 and digits.startswith("1"):
             digits = digits[1:]
         if not digits:
@@ -243,6 +263,19 @@ def _normalise_timestamp(value: Any, required: bool) -> str | None:
     """
     if isinstance(value, list | tuple | dict | set):
         raise ValueError(f"expected a timestamp string, got {type(value).__name__}")
+    # A number is refused rather than parsed, which is the same decision the ingestion
+    # gate makes about a numeric date column and for the same reason: pandas reads a
+    # number here as nanoseconds since 1970, so a funnel sending 20260115 got
+    # '1970-01-01 00:00:00' - with session_day, session_day_of_week, session_hour and
+    # from_start_to_register all confidently wrong, a 200, and nothing to show it. The
+    # epoch is the floor of the accepted range, so the bound below cannot catch it.
+    # 20260115 as a date and 20260115 as a nanosecond count are not distinguishable here,
+    # so the request is refused instead of guessed at.
+    if isinstance(value, bool | int | float):
+        raise ValueError(
+            f"expected a timestamp string, got the number {value!r}. pandas would read "
+            f"it as nanoseconds since 1970; send it as '%Y-%m-%d %H:%M:%S' text."
+        )
     if isinstance(value, datetime):
         parsed = value
     else:

@@ -80,6 +80,17 @@ def parse_quartz(expression: str) -> CronFields:
         )
     second, minute, hour, day, month, day_of_week = parts[:6]
 
+    # APScheduler has a `year` field; Quartz's seventh field was simply dropped, so
+    # '0 0 5 ? * SUN 2030' fired every Sunday here and never on Databricks - the widest
+    # possible disagreement between the two schedulers, from a field that was ignored.
+    year = parts[6] if len(parts) == 7 else "*"
+    if year.strip() not in {"*", "?", ""}:
+        raise ValueError(
+            f"{expression!r} restricts the year to {year!r}. That field was being dropped, "
+            f"so the local runner fired on every matching day while Databricks fired only "
+            f"inside that year - use '*' and let the schedule be turned off instead."
+        )
+
     # Quartz requires exactly one of day-of-month / day-of-week to be '?'.
     # APScheduler has no '?', so it becomes '*'.
     day = "*" if day == "?" else day

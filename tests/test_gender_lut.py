@@ -215,3 +215,52 @@ def test_a_table_built_the_old_way_reports_itself(tmp_path):
     current = GenderLookup.from_mapping({"John": ("male", 0.99)})
     assert _gender_source(current) == "precomputed"
     assert _gender_source(None) == "names_dataset"
+
+
+def _write_table(path, names, genders, confidences, rows):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from bl_ranking.models.gender_lut import KEY_SCHEME, KEY_SCHEME_FIELD, ROW_COUNT_FIELD
+
+    table = pa.table({
+        "name": pa.array(names),
+        "gender": pa.array(genders).dictionary_encode(),
+        "confidence": pa.array(confidences, type=pa.float64()),
+    }).replace_schema_metadata({
+        KEY_SCHEME_FIELD: KEY_SCHEME, ROW_COUNT_FIELD: str(rows).encode(),
+    })
+    pq.write_table(table, str(path))
+    return path
+
+
+def test_a_truncated_gender_table_is_refused(tmp_path):
+    """A short table has the right columns, the right dtypes and a plausible file size, and
+    answers 'unknown' for everything it lost - while GET /model reports a healthy
+    'precomputed'. The builder's own row count is stamped into the parquet, so this is exact
+    and needs no arbitrary "too small" threshold."""
+    import pytest
+
+    from bl_ranking.models.gender_lut import GenderLookup
+
+    path = _write_table(tmp_path / "short.parquet", ["John"], ["male"], [0.9], rows=714212)
+    with pytest.raises(ValueError, match="truncated"):
+        GenderLookup.load(path)
+
+    # The same file, honest about its size, loads.
+    path = _write_table(tmp_path / "small.parquet", ["John"], ["male"], [0.9], rows=1)
+    assert GenderLookup.load(path).lookup("John") == ("male", 0.9)
+
+
+def test_a_gender_table_with_the_columns_swapped_is_refused(tmp_path):
+    """It loads cleanly, resolves every name to 'unknown', and leaves GET /model reporting
+    'precomputed'. detect_gender_with_confidence only ever returns male, female or
+    unknown, so anything else in that column was not written by build()."""
+    import pytest
+
+    from bl_ranking.models.gender_lut import GenderLookup
+
+    path = _write_table(tmp_path / "swapped.parquet",
+                        ["male", "female"], ["John", "Mary"], [0.9, 0.8], rows=2)
+    with pytest.raises(ValueError, match="wrong way round"):
+        GenderLookup.load(path)

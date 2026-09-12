@@ -158,3 +158,19 @@ def test_the_two_paths_agree_on_a_span_of_years(paths, example_user):
     research = (pd.Series([pd.to_datetime(register_date)])
                 - pd.Series([pd.to_datetime(session_dt)])).dt.total_seconds().iloc[0]
     assert row["from_start_to_register"] == research
+
+
+def test_a_missing_register_date_is_refused_with_the_same_type_by_both(paths, example_user):
+    """The research path raises a bare `Exception` for this (import_preprocess line 67,
+    verbatim research code), which `except MissingRegisterDate` in the endpoint cannot
+    catch - so with `serving.feature_path = research`, a documented setting, the
+    documented 422 came back as a 500. Both paths now refuse it up front, typed."""
+    import pytest
+
+    from bl_ranking.serving.fast_features import MissingRegisterDate
+
+    research, fast = paths
+    user = {**example_user, "register_date": None}
+    for ranker in (research, fast):
+        with pytest.raises(MissingRegisterDate):
+            ranker.rank(user)

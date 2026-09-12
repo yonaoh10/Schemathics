@@ -6,7 +6,11 @@ The parts that matter for this system are identical either way:
 
   * every write produces a new, immutable table version;
   * a training run records the version it read, so the exact input is recoverable;
-  * time travel lets a rollback re-train on precisely the data a past run saw.
+  * time travel lets a rollback re-train on precisely the data a past run saw -
+    `python -m bl_ranking.training.job --mode production --delta-version N`, where N is
+    the `data.delta_version` the run being reproduced logged. The flag exists because
+    this claim was here long before anything could act on it: the training job took the
+    latest version and offered no way to ask for another.
 
 Swapping in Databricks means changing the URI to `catalog.schema.table` and replacing
 these two functions with `spark.read.table` / `DataFrame.write.saveAsTable`. Nothing
@@ -109,7 +113,17 @@ def read_snapshot(table_uri: str | Path, version: int | None = None,
         raise FileNotFoundError(
             f"Delta table {path} does not exist. Run `make ingest` first."
         )
-    table = DeltaTable(str(path), version=version)
+    try:
+        table = DeltaTable(str(path), version=version)
+    except Exception as exc:  # noqa: BLE001 - delta-rs raises several types here
+        # delta-rs answers a version that does not exist with a generic error, and a
+        # negative one by saying the table was not found - for a table that plainly is,
+        # since the path check above just passed. Say which version was asked for and
+        # which ones there are.
+        latest = DeltaTable(str(path)).version()
+        raise ValueError(
+            f"Delta table {path} has no version {version}; versions 0..{latest} exist."
+        ) from exc
     frame = table.to_pandas()
 
     if lookback_days:

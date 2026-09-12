@@ -198,6 +198,25 @@ class Settings:
                 f"model.payout.context_size must be at least 1, "
                 f"got {self.model.payout.context_size}"
             )
+        if self.data.days_for_test < 1:
+            raise ValueError(
+                f"data.days_for_test must be at least 1, got {self.data.days_for_test}"
+            )
+        lookback = self.data.lookback_days
+        if lookback is not None and lookback < 1:
+            raise ValueError(
+                f"data.lookback_days must be positive, got {lookback}. Leave it unset "
+                f"(null) to use the whole table: 0 silently meant that, and a negative "
+                f"value produced an empty window and a pandas error naming nothing."
+            )
+        if lookback is not None and lookback <= self.data.days_for_test:
+            raise ValueError(
+                f"data.lookback_days ({lookback}) must exceed data.days_for_test "
+                f"({self.data.days_for_test}). The research code splits the last "
+                f"{self.data.days_for_test} days off the window before it fits, so a "
+                f"window that short leaves the classifier nothing to learn from and the "
+                f"failure lands inside CatBoost, well into the run."
+            )
 
     def flat(self, prefix: str = "") -> dict[str, Any]:
         """Dotted key/value view, used to log the whole config as MLflow params."""
@@ -365,6 +384,31 @@ def _checked_shape(value: Any, default: Any, where: str, annotation: Any = None)
         if isinstance(value, list | tuple | dict | set):
             raise ValueError(
                 f"{where}: expected a single value, got {type(value).__name__} {value!r}"
+            )
+        if value is None:
+            return None
+        # A default of None says nothing about the type, so read the annotation - the same
+        # source string `_as_field_type` reads to convert an environment override. Without
+        # this the nullable settings took anything scalar: `lookback_days: true` reached
+        # `pd.Timedelta(days=True)` and quietly meant one day, and `tracking_uri: 8080`
+        # became an int that `_registry_is_authoritative` read as a local path, switching
+        # off the guard that protects a rollback.
+        declared = str(annotation or "")
+        if "bool" in declared:
+            expected: type | tuple[type, ...] = bool
+        elif "int" in declared:
+            expected = int
+        elif "float" in declared:
+            expected = (int, float)
+        elif "str" in declared:
+            expected = str
+        else:
+            return value
+        if isinstance(value, bool) and expected is not bool:
+            raise ValueError(f"{where}: expected {declared}, got the boolean {value!r}")
+        if not isinstance(value, expected):
+            raise ValueError(
+                f"{where}: expected {declared}, got {type(value).__name__} {value!r}"
             )
         return value
     if value is None:

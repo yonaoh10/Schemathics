@@ -95,6 +95,20 @@ def require_survey_answers(user: dict[str, Any]) -> None:
         )
 
 
+def require_register_date(user: dict[str, Any]) -> None:
+    """Refuse a user who never submitted the survey, before either path runs.
+
+    The same reason require_survey_answers is checked up front, and the same hazard: the
+    research path reaches its own check (import_preprocess line 67) and raises a bare
+    `Exception` with this message, which is verbatim research code and cannot be edited.
+    `except MissingRegisterDate` in the endpoint does not catch a bare Exception, so with
+    `serving.feature_path = research` - a documented setting - the documented 422 became
+    a 500. Checking here makes the refusal identical, and typed, on both paths.
+    """
+    if _is_na(user.get("register_date")):
+        raise MissingRegisterDate("user cannot be a lead - register_date is absent")
+
+
 def build_features(user: dict[str, Any], brands: np.ndarray,
                    gender_lookup) -> pd.DataFrame:
     """Return the 25 training features for one user against every brand.

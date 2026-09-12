@@ -135,7 +135,7 @@ def _as_frame(model_input: Any) -> pd.DataFrame:
 # What RankRequest insists on. Everything else is optional there, and has to be optional
 # here too, or the portable form refuses payloads the HTTP endpoint accepts.
 REQUIRED_REQUEST_FIELDS: tuple[str, ...] = (
-    "session_dt", "register_date", "campaign_id", "page",
+    "session_dt", "campaign_id", "page",
 )
 
 

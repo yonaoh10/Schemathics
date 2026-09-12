@@ -1,16 +1,33 @@
 """CSV -> Delta ingestion with the data-quality gate the research code depends on.
 
-The research scripts are treated as fixed. They make three assumptions about their
-input that a raw warehouse dump does not guarantee:
+The research scripts are treated as fixed. They make assumptions about their input that a
+raw warehouse dump does not guarantee:
 
-  1. `cellphone` casts cleanly to int   (bl_models_train.py line 100)
-  2. the survey columns support `.str`  (line 110)
-  3. `payout` is numeric                (line 74)
+  1. `cellphone` casts cleanly to int        (bl_models_train.py line 100)
+  2. the survey columns support `.str`       (line 110)
+  3. `fname` and `lname` support `.str`      (lines 209-210)
+  4. `payout` is numeric, and has values     (line 74)
+  5. the timestamp columns are text          (line 156)
+  6. `campaign_id` and sub1/2/3 mean the same thing here as at serve time
 
 Rather than patch the model code, ingestion enforces those invariants once, at the
 boundary, and reports how many rows it had to repair. That keeps the contract explicit
-and auditable: the counters are logged to MLflow with every training run, so a sudden
-jump in repairs is visible instead of silently changing a feature.
+and auditable: the counters travel in the Delta commit and are logged as params by the
+training run that reads that version, so a sudden jump in repairs is visible instead of
+silently changing a feature.
+
+Three of the invariants cannot be repaired, only refused, and the refusals are as much
+the point as the repairs: a survey or name column with no text in it at all, a payout
+column with no numbers in it at all, and a timestamp column pandas would read as
+nanoseconds. Each of those used to pass the gate with every counter at zero and fail
+twenty minutes later from inside the vendored code, where the message named neither the
+column nor the extract.
+
+The counters answer two different questions and it is worth keeping them apart.
+`timestamp_format_fallbacks` counts rows whose layout differs from the rest of their
+column - the case pandas itself notices. `timestamp_ambiguous_layout` counts rows where
+the reading is a coin flip (06/01/2026), which is the case pandas does *not* notice:
+inference picks one order for the whole column and nothing looks unusual.
 """
 
 from __future__ import annotations
@@ -19,6 +36,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +77,10 @@ SURVEY_COLUMNS: list[str] = [
 # The attribution ids the research code fills and stringifies together, and the value
 # it fills them with (bl_models_train.py: `fillna('Other')` then `.astype(str)`).
 SUB_ID_COLUMNS = ("sub1", "sub2", "sub3")
+
+# Columns the research code calls `.str` on outside the survey group: additional_features
+# takes `.str.len()` of both (bl_models_train.py lines 209-210).
+NAME_COLUMNS = ("fname", "lname")
 RESEARCH_NULL_CATEGORY = "Other"
 
 # Where the gate's report lives inside the Delta commit it produced.
@@ -209,7 +231,14 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     #    categorical feature, so anything unparseable becomes 0 (prefix '0') rather
     #    than crashing the run or, worse, silently dropping the row.
     raw_phone = frame["cellphone"]
-    digits = raw_phone.astype(str).str.replace(r"\D", "", regex=True)
+    # The '.0' comes off before the non-digits do. A float-typed source column writes
+    # '13055550142.0', whose digits are '130555501420' - twelve, so the country-code rule
+    # below does not fire and the prefix becomes '130' where the same number written as an
+    # integer gives '305'. Reading the column as text (READ_AS_TEXT) preserves the
+    # spelling; it does not interpret it.
+    digits = (raw_phone.astype(str)
+              .map(_without_float_suffix)
+              .str.replace(r"\D", "", regex=True))
     # Strip a leading US country code so '+1 786...' and '786...' give the same prefix.
     # The "1" matters: without it this stripped the first digit of *any* 11-digit
     # number while serving/schemas.py only strips a leading 1, so the same phone
@@ -235,31 +264,12 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     #    `fillna("other")` then turns it into 'other', which is exactly what serving's
     #    mirror (_lower_or_other) returns for one. Stringifying would put '12' in
     #    training against 'other' at serve time - a new skew in place of a crash.
-    nonstring = 0
-    for col in SURVEY_COLUMNS:
-        values = frame[col].astype("object")
-        is_text = values.map(lambda value: isinstance(value, str))
-        nonstring += int((values.notna() & ~is_text).sum())
-        frame[col] = values.where(is_text, other=None)
-    repairs["survey_nonstring"] = nonstring
-
-    # A column left with no text at all cannot be repaired into one. Its nulls become
-    # empty cells in the staged CSV, pandas reads those back as float64, and
-    # `.str.lower()` raises on float64 - twenty minutes into the run, from inside the
-    # vendored code. Filling a sentinel instead is not value-preserving either: the
-    # research code drops rows with fewer than five survey answers *before* it lowers
-    # them, so a filled null would keep rows the researcher's pipeline discards and
-    # quietly change the training set. An entire survey question arriving empty is an
-    # upstream outage, not a row-level repair, so it is refused here - before a bad
-    # snapshot reaches Delta, while the previous version is still the one training reads.
-    empty = [col for col in SURVEY_COLUMNS if not frame[col].notna().any()]
-    if empty:
-        raise ValueError(
-            "Survey columns arrived with no text answers at all: "
-            + ", ".join(empty)
-            + ". The research code calls .str.lower() on these, which pandas refuses "
-            "on a column it reads back as numeric. Check the upstream extract."
-        )
+    repairs["survey_nonstring"] = _keep_only_text(frame, SURVEY_COLUMNS)
+    # fname and lname need exactly the same treatment, and for a while did not have it.
+    # additional_features calls `.str.len()` on both (bl_models_train.py lines 209-210),
+    # so a name column that is numeric or fully redacted upstream passed the gate with
+    # every counter at zero and killed the run inside the vendored code.
+    repairs["name_nonstring"] = _keep_only_text(frame, NAME_COLUMNS)
 
     # 3. payout must be numeric for fillna(0) and the payout > 0 mask.
     payout = pd.to_numeric(frame["payout"], errors="coerce")
@@ -272,6 +282,19 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     payout = payout.mask(not_finite)
     repairs["payout"] = int(repairs["payout"]) + int(not_finite.sum())
     frame["payout"] = payout
+
+    # A payout column with no numbers in it at all is refused, for the same reason an
+    # empty survey column is: it cannot be repaired into a usable one, and it fails a long
+    # way from here. Every repair counter reports zero (there was nothing to coerce),
+    # `_typed_for_delta` then types the all-null column as *string* so the table's schema
+    # silently changes, and the run dies half an hour later inside CatBoost with "Labels
+    # variable is empty" - which names neither the column nor the extract.
+    if not bool(payout.notna().any()):
+        raise ValueError(
+            "payout arrived with no numeric values at all. It is the regression label "
+            "and the `payout > 0` mask the research code builds its TabPFN context from, "
+            "so there is nothing to train. Check the upstream extract."
+        )
 
     # 4. Attribution ids must stringify identically in training and in serving.
     #    The research code does `fillna('Other')` then `.astype(str)` on sub1/sub2/sub3.
@@ -306,6 +329,7 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     # Timestamps are normalised to ISO strings so the Delta round trip reproduces
     # exactly what pd.read_csv would have handed the research code.
     timestamp_fallbacks = 0
+    ambiguous_layout = 0
     for col in ("session_dt", "conversion_dt", "register_date"):
         # A numeric timestamp column is refused rather than parsed. pandas reads an
         # integer as nanoseconds since the epoch, so a funnel switching to a YYYYMMDD
@@ -330,21 +354,114 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
         # every other repair, so a funnel changing its date format shows up here
         # before it shows up in the model.
         timestamp_fallbacks += fallback_rows
+        # And a separate count for the failure the fallback counter cannot see: a *column*
+        # written the other way round. `timestamp_format_fallbacks` counts a row whose
+        # layout differs from its column's, which is the case pandas notices; when the
+        # whole column is DD/MM/YYYY, inference reads all of it as MM/DD and nothing looks
+        # unusual. This counts the rows where the reading is a coin flip, which is the
+        # thing an operator can actually watch: it is 0 for an ISO column, and jumps to the
+        # whole column the week a funnel changes format.
+        ambiguous_layout += _count_ambiguous_dates(frame[col])
         frame[col] = parsed.dt.strftime("%Y-%m-%d %H:%M:%S").where(parsed.notna(), None)
 
     repairs["timestamp_format_fallbacks"] = timestamp_fallbacks
+    repairs["timestamp_ambiguous_layout"] = ambiguous_layout
 
     # A row with no session timestamp cannot be placed on the train/test timeline.
     before = len(frame)
     frame = frame[frame["session_dt"].notna()].reset_index(drop=True)
     repairs["dropped_no_session_dt"] = before - len(frame)
 
+    # Checked on the rows that survive, which is the only set that matters. Evaluated
+    # before the drop, a column whose only text sat on rows the gate was about to discard
+    # satisfied it - and the research code then died on `.str.lower()` anyway.
+    _require_some_text(frame, (*SURVEY_COLUMNS, *NAME_COLUMNS))
+
     return frame, repairs
+
+
+def _keep_only_text(frame: pd.DataFrame, columns: tuple[str, ...] | list[str]) -> int:
+    """Null every non-string value in `columns`, and return how many there were.
+
+    pandas grants `.str` by the values a column holds, not by its dtype: an object column
+    of integers still refuses it. So `astype("object")`, which is what this used to do,
+    moved the dtype and left the invariant broken - and the counter reported a repair that
+    had not happened.
+
+    Nulled rather than stringified. Research's own `.str` accessor yields NaN for a
+    non-string element, and serving's mirror (_lower_or_other) returns 'other' for one, so
+    nulling is what both sides already do with such a value. Stringifying would put '12'
+    in training against 'other' at serve time - a new skew in place of a crash.
+    """
+    nonstring = 0
+    for col in columns:
+        if col not in frame.columns:
+            continue
+        values = frame[col].astype("object")
+        is_text = values.map(lambda value: isinstance(value, str))
+        nonstring += int((values.notna() & ~is_text).sum())
+        frame[col] = values.where(is_text, other=None)
+    return nonstring
+
+
+def _require_some_text(frame: pd.DataFrame, columns: tuple[str, ...]) -> None:
+    """Refuse an extract where one of these columns has no text left in it at all.
+
+    It cannot be repaired into a usable one. Its nulls become empty cells in the staged
+    CSV, pandas reads those back as float64, and the research code's `.str.lower()` /
+    `.str.len()` raises on float64 - twenty minutes into the run, from inside the vendored
+    code. Filling a sentinel is not value-preserving either: the research code drops rows
+    with fewer than five survey answers *before* it lowers them, so a filled null would
+    keep rows the researcher's pipeline discards and quietly change the training set.
+
+    An entire question or name column arriving empty is an upstream outage, not a
+    row-level repair, so it is refused here - before a bad snapshot reaches Delta, while
+    the previous version is still the one training reads.
+    """
+    if frame.empty:
+        # Every column is empty when there are no rows, and the caller has a better
+        # message for that case (naming the file and the counters that explain it).
+        return
+    empty = [col for col in columns
+             if col in frame.columns and not frame[col].notna().any()]
+    if empty:
+        raise ValueError(
+            "These columns arrived with no text in them at all: "
+            + ", ".join(empty)
+            + ". The research code calls .str on each of them, which pandas refuses on a "
+            "column it reads back as numeric. Check the upstream extract."
+        )
 
 
 
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 
+
+
+# A date written with slashes or dots and a one- or two-digit leading field. '2026-01-06'
+# and '2026/01/06' are not in this shape: a four-digit year first is unambiguous.
+_AMBIGUOUS_DATE = re.compile(r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{2,4}")
+
+
+def _count_ambiguous_dates(values: pd.Series) -> int:
+    """Rows whose date could honestly be read either way round.
+
+    Both of the first two fields at most 12, and different from each other - so pandas'
+    choice between DD/MM and MM/DD changes the answer and neither reading is provably
+    wrong. Counted rather than refused, because the extract may genuinely be MM/DD and
+    the gate has no way to know; session_day and session_day_of_week are model features,
+    so what matters is that the ambiguity is *visible* in the run's parameters instead of
+    being resolved silently.
+    """
+    text = values.dropna().astype(str)
+    if text.empty:
+        return 0
+    parts = text.str.extract(_AMBIGUOUS_DATE).dropna()
+    if parts.empty:
+        return 0
+    first = pd.to_numeric(parts[0], errors="coerce")
+    second = pd.to_numeric(parts[1], errors="coerce")
+    return int(((first <= 12) & (second <= 12) & (first != second)).sum())
 
 
 def _to_utc_naive(values: pd.Series) -> tuple[pd.Series, int]:
@@ -432,6 +549,23 @@ def _exact_int64_column(values: pd.Series) -> pd.Series:
     parsed = pd.Series([_as_int64(v) for v in values], index=values.index, dtype=object)
     return parsed
 
+def _without_float_suffix(text: str) -> str:
+    """Drop a trailing '.0' from an otherwise-numeric text.
+
+    A float-typed warehouse column writes a phone number as '13055550142.0', and one
+    stripped of its non-digits is '130555501420' - twelve digits, so the country-code rule
+    does not fire and the cellphone_prefix feature becomes '130' instead of '305'. The
+    same value arriving as a JSON float renders identically, so both sides of the system
+    need the one rule; this is it, and both import it.
+
+    Only an exact '.0' is removed. '3055550142.5' is left alone: a fractional phone number
+    is junk either way, and the two sides have to agree about junk too.
+    """
+    if text.endswith(".0") and text[:-2].lstrip("+-").isdigit():
+        return text[:-2]
+    return text
+
+
 def _as_identifier(value: object) -> str | None:
     """Render an attribution id the way a JSON request would: no trailing '.0'.
 
@@ -456,19 +590,31 @@ def _as_identifier(value: object) -> str | None:
     # same id and must produce the same category level.
     if text.endswith(".0") and text[:-2].lstrip("-").isdigit():
         text = text[:-2]
-    # A numeric id is rendered the way pandas renders it after a CSV round trip:
-    # no leading zeros, no leading '+'. This is what makes the rule *canonical* rather
-    # than merely shared. The staged CSV (stage_for_research_code) is re-read with
+    # A numeric id is rendered the way pandas renders it after a CSV round trip: no
+    # leading zeros, no leading '+', no '.0'. This is what makes the rule *canonical*
+    # rather than merely shared. The staged CSV (stage_for_research_code) is re-read with
     # pandas' own inference, and an all-digit column comes back as int64 or uint64 - so
     # '007' becomes 7 and the research code's `.astype(str)` yields '7', while a request
     # carrying '007' would keep it. Normalising here means both sides land on '7'.
-    # It does collapse '007' and '7' onto one level, which is correct for an
-    # attribution id and is in any case what the round trip already did to training.
-    stripped = text[1:] if text[:1] in "+-" else text
-    if stripped.isdigit():
-        sign = "-" if text[:1] == "-" else ""
-        return f"{sign}{int(stripped)}"
-    return text
+    # It does collapse '007' and '7' onto one level, which is correct for an attribution id
+    # and is in any case what the round trip already did to training.
+    #
+    # Decimal, not float: it reads every spelling a SQL DECIMAL or float column exports -
+    # '7448788.00', '1e3', '1.2e17' - and reads them exactly, where `int(float(text))`
+    # would round a 17-digit id. An earlier version handled a single trailing '.0' and
+    # nothing else, so '7448788.00' survived the gate and then stopped the weekly retrain
+    # at the round-trip check. A value that is numeric but *not* a whole number is left
+    # exactly as it came: truncating '7.5' to '7' would silently change an id.
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return text
+    # 'nan' and 'Inf' parse as Decimals and are not whole numbers in any useful sense;
+    # Infinity also raises on int(). Left as the text they arrived as, which is what both
+    # sides then agree on.
+    if not number.is_finite() or number != number.to_integral_value():
+        return text
+    return str(int(number))
 
 
 def _require_columns(frame: pd.DataFrame) -> None:
@@ -498,6 +644,30 @@ def _require_columns(frame: pd.DataFrame) -> None:
             + ", ".join(duplicated)
             + ". pandas renames the second copy, so the gate cannot tell which one "
             "carries the real values. Fix the extract."
+        )
+
+    # A header that differs from a required one only in case or surrounding whitespace is
+    # the same hazard wearing a different hat. pandas keeps both as distinct columns, so
+    # neither the missing-column check nor the mangled-duplicate check above sees anything
+    # wrong - and the gate then reads whichever copy is spelled exactly right, which in a
+    # warehouse view exporting both a snake_case and a display-cased column is as likely as
+    # not the empty one. Trailing whitespace in a header is something CSV exporters do
+    # routinely, so this is not an exotic input.
+    required = set(REQUIRED_COLUMNS)
+    lookalikes = sorted(
+        {
+            f"{column!r} vs {column.strip().casefold()!r}"
+            for column in frame.columns
+            if (text := str(column)) not in required
+            and text.strip().casefold() in required
+        }
+    )
+    if lookalikes:
+        raise ValueError(
+            "Input extract has column name(s) that differ from a column the training "
+            "code selects only in case or whitespace: " + ", ".join(lookalikes)
+            + ". The gate would read the exactly-spelled one, which may not be the one "
+            "carrying the values. Fix the extract."
         )
 
 

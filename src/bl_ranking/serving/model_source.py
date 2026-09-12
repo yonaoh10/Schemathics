@@ -32,6 +32,7 @@ import mlflow
 from mlflow.tracking import MlflowClient
 
 from bl_ranking.config import Settings, resolve
+from bl_ranking.models import bundle as bundle_files
 
 log = logging.getLogger("bl_ranking.serving")
 
@@ -44,15 +45,30 @@ _URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]+):")
 _MODELS_URI = re.compile(r"^models:/(?P<name>[^/@]+)(?:@(?P<alias>.+)|/(?P<version>\d+))$")
 
 
+# How the bundle a worker is serving was chosen. Reported by GET /model, because "this
+# worker is serving an unregistered local directory" is not something an operator should
+# have to read a start-up log to discover: the likeliest cause is a mistyped
+# BL_MLFLOW__REGISTERED_MODEL or BL_MLFLOW__SERVING_ALIAS, and the symptom is a healthy
+# endpoint serving whatever happens to be newest on disk.
+BUNDLE_SOURCE_PINNED = "pinned_uri"
+BUNDLE_SOURCE_REGISTRY = "registry_alias"
+BUNDLE_SOURCE_LOCAL = "local_run_directory"
+
+# Set by resolve_bundle, read by the app when it builds /model.
+last_bundle_source: str = BUNDLE_SOURCE_REGISTRY
+
+
 def resolve_bundle(settings: Settings) -> Path:
     """Return a local directory containing the model bundle."""
+    global last_bundle_source
     explicit = settings.serving.model_uri
     if explicit:
+        last_bundle_source = BUNDLE_SOURCE_PINNED
         return _from_uri(explicit, settings)
 
     default_uri = f"models:/{settings.mlflow.registered_model}@{settings.mlflow.serving_alias}"
     try:
-        return _from_uri(default_uri, settings)
+        resolved = _from_uri(default_uri, settings)
     except Exception as exc:  # noqa: BLE001 - classified below
         if _registry_is_authoritative(settings) and not _alias_is_unset(exc):
             # The local fallback picks the NEWEST bundle on disk, which after a rollback
@@ -68,9 +84,16 @@ def resolve_bundle(settings: Settings) -> Path:
                 f"fall back to a local bundle, which after a rollback would be the "
                 f"version that was rolled back from."
             ) from exc
-        log.warning("could not resolve %s (%s); no tracking server is configured, so "
-                    "falling back to the newest local run", default_uri, exc)
+        log.warning("could not resolve %s (%s); falling back to the newest local run. "
+                    "GET /model reports bundle_source=%s so this is visible from outside "
+                    "the worker - a mistyped registered model or alias looks exactly like "
+                    "a registry with nothing promoted yet.",
+                    default_uri, exc, BUNDLE_SOURCE_LOCAL)
+        last_bundle_source = BUNDLE_SOURCE_LOCAL
         return _latest_local_bundle(settings)
+    else:
+        last_bundle_source = BUNDLE_SOURCE_REGISTRY
+        return resolved
 
 
 def _alias_is_unset(exc: BaseException) -> bool:
@@ -184,6 +207,15 @@ def _from_uri(uri: str, settings: Settings) -> Path:
 
 
 def _latest_local_bundle(settings: Settings) -> Path:
+    """The most recently trained local bundle.
+
+    Ordered by each bundle's own `trained_at`, not by directory name. The names are UTC
+    timestamps and do sort correctly, but only for bundles this version produced: an
+    earlier one stamped them in local time, so a container whose TZ moved backwards made
+    the newest bundle stop being the last name alphabetically. The manifest records when
+    the run happened and is the thing that actually answers the question. A bundle with no
+    readable manifest falls back to its name, which keeps the ordering total.
+    """
     run_root = resolve(settings.paths.run_root)
     candidates = sorted(run_root.glob("*/bundle"))
     if not candidates:
@@ -191,6 +223,14 @@ def _latest_local_bundle(settings: Settings) -> Path:
             f"no model bundle found under {run_root}. Run `make train-prod` first, "
             f"or point serving.model_uri at a registered version."
         )
-    chosen = candidates[-1]
+
+    def trained_at(bundle: Path) -> tuple[str, str]:
+        try:
+            manifest = bundle_files.Manifest.read(bundle)
+        except Exception:  # noqa: BLE001 - an unreadable manifest orders by name alone
+            return ("", bundle.parent.name)
+        return (manifest.trained_at or "", bundle.parent.name)
+
+    chosen = max(candidates, key=trained_at)
     log.info("serving the local bundle at %s", chosen)
     return chosen

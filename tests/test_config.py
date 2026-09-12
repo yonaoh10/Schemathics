@@ -172,3 +172,26 @@ def test_a_config_file_that_is_not_yaml_names_the_file(tmp_path, monkeypatch):
     path = _write_config(tmp_path, "this: is: not: yaml:\n\tbad\n", monkeypatch)
     with pytest.raises(ValueError, match=str(path.name)):
         Settings.load()
+
+
+@pytest.mark.parametrize(("value", "fragment"), [
+    ("0", "must be positive"),
+    ("-5", "must be positive"),
+    # data.days_for_test is 7, and the research code splits that many days off the
+    # window before it fits - so a window of 7 leaves the classifier nothing.
+    ("7", "must exceed data.days_for_test"),
+])
+def test_a_lookback_window_that_leaves_nothing_to_fit_is_refused(monkeypatch, value, fragment):
+    """Unvalidated, 0 silently meant "the whole table", a negative value produced an empty
+    window and a pandas error naming nothing, and anything at or below days_for_test
+    failed inside CatBoost twenty minutes into the run."""
+    monkeypatch.setenv("BL_DATA__LOOKBACK_DAYS", value)
+    with pytest.raises(ValueError, match=fragment):
+        Settings.load()
+
+
+def test_a_usable_lookback_window_is_accepted(monkeypatch):
+    monkeypatch.setenv("BL_DATA__LOOKBACK_DAYS", "8")
+    assert Settings.load().data.lookback_days == 8
+    monkeypatch.setenv("BL_DATA__LOOKBACK_DAYS", "")      # unset means the whole table
+    assert Settings.load().data.lookback_days is None

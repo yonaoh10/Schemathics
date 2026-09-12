@@ -40,6 +40,7 @@ from fastapi.responses import ORJSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from bl_ranking.config import Settings
+from bl_ranking.serving import model_source
 from bl_ranking.serving.fast_features import MissingRegisterDate
 from bl_ranking.serving.model_source import resolve_bundle
 from bl_ranking.serving.ranker import BrandRanker, InsufficientSurveyData
@@ -214,8 +215,15 @@ def rank_bare(payload: RankRequest) -> ORJSONResponse:
     started = time.perf_counter()
     try:
         ranking = ranker.rank(payload.to_user_data())
-    except (InsufficientSurveyData, MissingRegisterDate):
+    except InsufficientSurveyData:
         REQUESTS.labels("insufficient_data").inc()
+        return ORJSONResponse({}, status_code=422)
+    except MissingRegisterDate:
+        # Counted under its own label, as on /rank. Folding it into insufficient_data
+        # here made the two endpoints label the same refusal differently, so an operator
+        # reading no_register_date was seeing /rank traffic only and could not tell a
+        # funnel that had stopped sending register_date from one asking too little.
+        REQUESTS.labels("no_register_date").inc()
         return ORJSONResponse({}, status_code=422)
     except Exception as exc:  # noqa: BLE001
         # Without this the failure returned a bare 500 from the ASGI stack: the error
@@ -250,6 +258,11 @@ def model_info() -> dict[str, Any]:
     ranker = _require_ranker()
     info = dict(ranker.describe())
     info["bundle"] = str(state.bundle_dir)
+    # Which of the three resolution tiers actually answered. A worker that fell back to a
+    # local run directory is healthy by every other measure, and the commonest reason is a
+    # mistyped registered model or alias - which looks identical to a registry with nothing
+    # promoted yet. Saying so here is what makes the two distinguishable without ssh.
+    info["bundle_source"] = model_source.last_bundle_source
     info["manifest"] = ranker.warm.manifest.as_tags()
     return info
 

@@ -142,10 +142,20 @@ Both research modes are preserved.
 
 | | `train_test=True` | `train_test=False` |
 |---|---|---|
-| data | all but the last 7 days | everything |
+| fitted on | all but the last 7 days | all but the last 7 days |
+| evaluated on | the last 7 days, per day | nothing |
 | output | per-day classification reports, payout MAE/MAPE at four thresholds | the four research artifacts |
 | registry | nothing | a new version, `champion` moved onto it |
 | command | `make train` | `make train-prod` |
+
+Both rows of "fitted on" are the same, and that is not a typo. `bl_preprocessing` calls
+`split_by_time(bl_data, days_for_test=7)` unconditionally and fits on the earlier part, so
+the most recent week is held back in production mode too — it is simply never scored
+there. This table said "everything" for a long time, and the bundle manifest reported the
+snapshot size as `rows_train`, which overstated it by about a tenth. Training on the full
+window would mean editing the given code, so the run reports the truth instead:
+`split.rows_fitted` and `split.rows_held_out` are what the models saw, `data.rows` is what
+was read.
 
 Every run logs the same technical parameters, so any two runs are comparable in the
 MLflow UI regardless of mode:
@@ -179,8 +189,15 @@ Evaluation mode, holding out the last 7 days:
 
 These come from the synthetic extract, so the absolute values describe the generator as
 much as the models. What they establish is that the pipeline runs end to end at real
-volume, that both label classes are present in every test-day bucket, and that the
-numbers land where the research code's own log puts them.
+volume and that the numbers land where the research code's own log puts them.
+
+One per-day bucket is not a day. The research split measures `split_day` in 24-hour
+offsets from the window's last *timestamp*, so the seventh bucket holds only the rows at
+that instant — one row, in every run so far. Its accuracy, precision, recall and F1 all
+came out at exactly 1.000 and sat in the comparison view beside six real days around
+0.59, which is a worse outcome than reporting nothing. The bucketing is the research
+code's and stays as it is; what changed is that each bucket now reports `clf.dayN.rows`
+and the scores only when the bucket contains both label classes.
 
 ### Versioning and rollback
 
@@ -200,7 +217,22 @@ docker compose -f docker/docker-compose.yml restart api
 
 Moving the alias moves the classifier, the payout context, the brand universe and the
 gender table together. `GET /model` reports what a live worker actually loaded, so
-"which version is serving?" is answerable without guessing.
+"which version is serving?" is answerable without guessing. Promotion and rollback are the
+same operation — the weekly retrain calls the same function `make rollback` does — so
+`champion_previous` is recorded either way and one command undoes either one.
+
+Rolling the *model* back is not the same as rolling the *data* back, and the second is
+sometimes what you want after a bad extract:
+
+```bash
+make versions                      # find the data.delta_version the good run logged
+python -m bl_ranking.training.job --mode production --delta-version 4
+```
+
+The Delta table keeps every version, so that retrains on exactly the rows a past run saw.
+The flag is new: the claim that time travel made a run reproducible sat in the code for a
+while before anything could act on it, because the training job always read the latest
+version and offered no way to ask for another.
 
 ### Schedule
 
@@ -380,6 +412,22 @@ question independent of latency.
 | `GET /model` | the serving version, backend, brand count |
 | `GET /metrics` | Prometheus |
 
+A request the models cannot score gets a 422 naming the reason, not a generic validation
+failure, because the funnel has to know which of the two it is:
+
+| `detail.error` | when |
+|---|---|
+| `insufficient_survey_answers` | fewer than 5 of the 8 survey answers present; the research pipeline would drop the row |
+| `register_date_absent` | no survey submission time, so the user cannot become a lead |
+
+Both are refused before either feature path runs, which is the only way to make them
+identical on both. `register_date` is therefore an *optional* field: while it was
+required, the second of those two errors was unreachable - every such payload came back
+as a generic validation failure - and on the research path it came back as a 500, because
+the research code raises a bare `Exception` for it that the endpoint's handler cannot
+catch. A `register_date` that is present but unreadable is still a validation error: a
+broken date format is not a user who cannot be a lead.
+
 ### What made it fast
 
 Measured in-process against the production model (81k training rows, a 70 MB
@@ -530,9 +578,18 @@ pipeline as given:
   while serving sends the exact integer. Both are fixed by reading those columns as text
   and converting afterwards — once a float has been rounded nothing downstream can undo it.
 
-Also enforced: `cellphone` must survive `.astype(int)`, survey columns must expose the
-`.str` accessor, and `payout` must be numeric. Every repair is counted and logged to
-MLflow, so a jump in repairs is visible instead of quietly changing a feature.
+Also enforced: `cellphone` must survive `.astype(int)`; the survey columns and `fname` and
+`lname` must expose the `.str` accessor; `payout` must be numeric *and* have values; and a
+timestamp column must be text, because pandas reads a number there as nanoseconds since
+1970 and turns every date into 1970-01-01. Every repair is counted and travels with the
+Delta version, so a jump in repairs is visible instead of quietly changing a feature.
+
+Some of those cannot be repaired, only refused, and the refusals are as much the point as
+the repairs. A survey column with no text at all, a name column that arrived numeric, a
+payout column with no numbers, a duplicated or look-alike header, an extract that leaves no
+rows: each of those used to pass the gate with every counter at zero and fail twenty
+minutes later from inside the vendored code, with a message that named neither the column
+nor the file.
 
 Two of those turned out to need more than one pass. `.str` is granted by the values a
 column holds and not by its dtype, so an object column of numeric survey codes still

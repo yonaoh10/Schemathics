@@ -48,6 +48,11 @@ def preserve_root_logging():
     setup_bl_logger (bl_models_train.py lines 25-42) calls
     `root_logger.handlers.clear()`, which would otherwise silence MLflow, uvicorn and
     everything else for the rest of the process. Harmless in a script, not in a job.
+
+    It must be entered before the trainer is *constructed*, not before `fit_()`:
+    setup_bl_logger runs in `BLPayoutModelsFit.__init__`. Entered after construction this
+    saves the already-cleared list and faithfully restores nothing - see the call site in
+    training/job.py, which is the only correct ordering.
     """
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
@@ -69,6 +74,8 @@ class ProductionTrainer(BLPayoutModelsFit):
         self.payout_cfg = payout_cfg
         self.backend_name = backend_name or payout_cfg.backend
         self.metrics: dict[str, float] = {}
+        # Filled by split_by_time. Empty until bl_preprocessing has run.
+        self.split_counts: dict[str, int] = {}
         self.payout_backend: PayoutBackend | None = None
         self._on_event = on_event or (lambda event, payload: None)
         super().__init__(input_path, input_file, output_predictors_path, train_test)
@@ -101,6 +108,30 @@ class ProductionTrainer(BLPayoutModelsFit):
         self._on_event("payout_fitted", backend.describe())
         return backend, tfm_context
 
+    # -- observed, not changed: what the time split actually did --------------------
+
+    def split_by_time(self, bl_data, days_for_test):
+        """The research split, unchanged. The row counts are recorded on the way past.
+
+        Worth recording because the research code calls this in BOTH modes, so the fit
+        never sees the last `days_for_test` days of the window - production mode
+        included. The docs described that mode as "fit on everything" and the bundle
+        manifest reported `rows_train = len(snapshot)`, which is the snapshot, not what
+        was fitted; on the real extract the two differ by about a tenth.
+
+        `days_for_test` is hard-coded to 7 at the call site (bl_models_train.py line 235)
+        and `data.days_for_test` only mirrors it, so it is taken from the argument here
+        rather than from the config - the number recorded is the one that was used.
+        """
+        bl_train, bl_test = super().split_by_time(bl_data, days_for_test)
+        self.split_counts = {
+            "rows_preprocessed": int(len(bl_data)),
+            "rows_fitted": int(len(bl_train)),
+            "rows_held_out": int(len(bl_test)),
+            "days_for_test": int(days_for_test),
+        }
+        return bl_train, bl_test
+
     # -- overridden seam: capture the numbers the researcher log prints as text -----
 
     def accuracy_classification_model(self, CB_model, y_test_all_days, x_test_all_days,
@@ -112,15 +143,26 @@ class ProductionTrainer(BLPayoutModelsFit):
         self.metrics.update(_classification_metrics(y_true, y_pred, prefix="clf"))
 
         # Per-day metrics make weekly drift visible in the MLflow comparison view.
+        #
+        # The bucket size is always reported, and the scores only when the bucket has both
+        # label classes in it. The research split buckets by 24-hour offsets from the
+        # window's last *timestamp* (bl_models_train.py line 217), so the final bucket
+        # holds only the rows at that instant: one row, in every run so far. Its accuracy,
+        # precision, recall and F1 all came out at exactly 1.000 and sat in the comparison
+        # view looking like a perfect day, next to six real ones around 0.59. A score
+        # computed from one row of one class is noise wearing a metric's name.
         for day in sorted(x_test_all_days["split_day"].unique()):
             mask = x_test_all_days["split_day"] == day
-            if mask.sum() == 0:
-                continue
             day_true = y_test_all_days.loc[mask, target_col]
+            label = f"clf.day{int(day)}"
+            # Reported even when the scores are not, so their absence is explainable
+            # rather than just absent. `support` from the report below is the *positive*
+            # count, which is not the same question.
+            self.metrics[f"{label}.rows"] = float(len(day_true))
+            if day_true.nunique() < 2:
+                continue
             day_pred = CB_model.predict(x_test_all_days[mask].drop("split_day", axis=1))
-            self.metrics.update(
-                _classification_metrics(day_true, day_pred, prefix=f"clf.day{int(day)}")
-            )
+            self.metrics.update(_classification_metrics(day_true, day_pred, prefix=label))
 
     def accuracy_cont_payout_prediction(self, model_tfm, x_test_payout, y_test_payout) -> None:
         super().accuracy_cont_payout_prediction(model_tfm, x_test_payout, y_test_payout)
