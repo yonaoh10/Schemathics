@@ -35,7 +35,7 @@ from typing import Any
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from bl_ranking.config import Settings
+from bl_ranking.config import Settings, env_override_keys
 from bl_ranking.models import bundle as bundle_files
 from bl_ranking.models.gender_lut import ARTIFACT_NAME as GENDER_ARTIFACT
 from bl_ranking.models.gender_lut import UNKNOWN, GenderLookup
@@ -43,6 +43,9 @@ from bl_ranking.models.payout import PayoutBackend, PayoutContext, prepare_backe
 from bl_ranking.serving import batch, fast_features
 
 log = logging.getLogger("bl_ranking.serving")
+
+# The dotted path of the setting the README tells operators to override.
+BACKEND_SETTING_KEY = "model.payout.backend"
 
 
 @dataclass
@@ -118,11 +121,23 @@ class BrandRanker:
 
         _assert_columns_match_the_classifier(catboost, context.columns, directory)
 
-        # The bundle records which backend produced it; that wins over local config,
-        # so a rollback to an older version brings its own backend with it.
-        backend_name = manifest.payout_backend or settings.model.payout.backend
+        # Precedence: an explicit operator override, then the bundle, then config.
+        #
+        # The bundle recording its own backend is deliberate - a rollback to an older
+        # version brings the backend it was built with. But it was winning over an
+        # explicit BL_MODEL__PAYOUT__BACKEND too, which made the switch the README
+        # documents do nothing at all: the variable changed the config, the manifest
+        # overruled it, and GET /model reported the bundle's backend as though nothing
+        # had been asked for.
+        if BACKEND_SETTING_KEY in env_override_keys():
+            backend_name = settings.model.payout.backend
+            log.info("payout backend %r set explicitly; overriding the bundle's %r",
+                     backend_name, manifest.payout_backend)
+        else:
+            backend_name = manifest.payout_backend or settings.model.payout.backend
         payout = prepare_backend(settings.model.payout, context, directory,
                                  name=backend_name, on_fallback=_log_fallback)
+        _assert_payout_columns_match(payout, context.columns, directory)
 
         gender_path = directory / GENDER_ARTIFACT
         if gender_path.exists():
@@ -328,6 +343,29 @@ def _assert_usable_brand_universe(all_clients: pd.DataFrame, directory: Path) ->
             f"Model bundle at {directory}: {bundle_files.CLIENTS_FILE} lists "
             f"{list(duplicated)[:5]} more than once. Duplicates collapse in the "
             f"ranking, so the response would carry fewer brands than the bundle has."
+        )
+
+
+def _assert_payout_columns_match(
+    payout: PayoutBackend, columns: list[str], directory: Path
+) -> None:
+    """The same mis-slotting check, on the other model.
+
+    The classifier check covers half the ranking. The CatBoost-based payout backends
+    slice the incoming frame by a column list they persisted at training time, so a
+    bundle whose payout model and payout context disagree scores the dollar half in the
+    wrong slots - with the classifier half still perfectly correct, which makes the
+    result look plausible rather than broken.
+    """
+    fitted = payout.expected_columns()
+    if fitted is None:
+        return
+    if list(fitted) != list(columns):
+        raise ValueError(
+            f"Model bundle at {directory} is inconsistent: the {payout.name} payout "
+            f"model was fitted on {len(fitted)} feature columns and the payout context "
+            f"lists {len(columns)}, or in a different order. Scoring would mis-slot the "
+            f"payout half of the ranking silently."
         )
 
 def _assert_columns_match_the_classifier(

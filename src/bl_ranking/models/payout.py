@@ -114,6 +114,17 @@ class PayoutBackend(ABC):
         and forcing every one of them to declare that would be noise.
         """
 
+    def expected_columns(self) -> list[str] | None:
+        """The feature columns this backend was fitted on, in order, if it has any.
+
+        The CatBoost-based backends slice the incoming frame by a column list they
+        persisted at training time, so a bundle whose payout model and payout context
+        disagree mis-slots features in the payout half of the ranking - the same hazard
+        the classifier check covers, on the other model. None means the backend has no
+        fixed column order to check against.
+        """
+        return None
+
     def prepare(self, context: PayoutContext, directory: Path) -> PayoutBackend:
         """Make this backend ready to predict, at serving start-up.
 
@@ -437,6 +448,9 @@ class CatBoostFallbackBackend(PayoutBackend):
             self._model.predict(batch.pool(self._cat_indices(batch.columns))), dtype=float
         )
 
+    def expected_columns(self) -> list[str] | None:
+        return list(self._columns) or None
+
     def _cat_indices(self, columns: list[str]) -> list[int]:
         return [columns.index(c) for c in self._cat_columns]
 
@@ -599,6 +613,9 @@ class SurrogateBackend(PayoutBackend):
     def predict_batch(self, batch) -> np.ndarray:
         indices = [batch.columns.index(c) for c in self._cat_columns]
         return np.asarray(self._student.predict(batch.pool(indices)), dtype=float)
+
+    def expected_columns(self) -> list[str] | None:
+        return list(self._columns) or None
 
     def save_extra(self, directory: Path) -> list[str]:
         target = directory / self.STUDENT_FILE

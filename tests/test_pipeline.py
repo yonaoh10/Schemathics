@@ -782,3 +782,68 @@ def test_re_promoting_the_serving_version_does_not_destroy_the_way_back(settings
     assert str(previous) != str(serving), (
         "champion_previous points at the serving version, so there is no way back"
     )
+
+def test_an_explicit_backend_override_beats_the_bundle(bundle, monkeypatch):
+    """The README documents a one-variable switch, and it did nothing.
+
+    A bundle records the backend it was built with so a rollback carries its own, which
+    is deliberate - but it was also overruling an explicit override, so the variable
+    changed the config, the manifest won, and GET /model reported the bundle's backend
+    as though nothing had been asked for.
+    """
+    from bl_ranking.config import Settings
+    from bl_ranking.serving.ranker import BrandRanker
+
+    monkeypatch.setenv("BL_MODEL__PAYOUT__BACKEND", "catboost_fallback")
+    asked = BrandRanker.load(bundle, Settings.load())
+    assert asked.describe()["payout_backend"] == "catboost_fallback"
+
+    # With nothing set, the bundle still decides - that half of the rule must hold too.
+    monkeypatch.delenv("BL_MODEL__PAYOUT__BACKEND", raising=False)
+    from bl_ranking.models import bundle as bundle_files
+    manifest = bundle_files.Manifest.read(bundle)
+    default = BrandRanker.load(bundle, Settings.load())
+    assert default.describe()["payout_backend"] == manifest.payout_backend
+
+def test_a_payout_model_with_the_wrong_column_order_is_refused(bundle, settings):
+    """The classifier check covered half the ranking; this covers the other half.
+
+    The CatBoost-based payout backends slice the frame by a column list they persisted
+    at training time, so a bundle whose payout model and payout context disagree scores
+    the dollar half in the wrong slots - while the classifier half stays correct, which
+    makes the result look plausible rather than broken.
+
+    The guard is exercised directly rather than by damaging a bundle on disk: only the
+    surrogate backend persists column metadata, so a disk-level test skips entirely
+    under the offline backend CI runs, which would leave the check unprotected.
+    """
+    import pytest
+
+    from bl_ranking.serving.ranker import BrandRanker, _assert_payout_columns_match
+
+    ranker = BrandRanker.load(bundle, settings)
+    payout = ranker.warm.payout
+    columns = list(ranker.warm.columns)
+
+    # A backend with no fixed column order has nothing to check and must not raise.
+    _assert_payout_columns_match(payout, columns, bundle)
+
+    class Mismatched:
+        name = "mismatched"
+
+        def expected_columns(self):
+            swapped = list(columns)
+            swapped[1], swapped[2] = swapped[2], swapped[1]
+            return swapped
+
+    with pytest.raises(ValueError, match="mis-slot"):
+        _assert_payout_columns_match(Mismatched(), columns, bundle)
+
+    class Shorter:
+        name = "shorter"
+
+        def expected_columns(self):
+            return columns[:-1]
+
+    with pytest.raises(ValueError, match="mis-slot"):
+        _assert_payout_columns_match(Shorter(), columns, bundle)

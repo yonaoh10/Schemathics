@@ -344,6 +344,13 @@ the numbers above are meant to let someone else overturn — and
 
 Switch with one variable: `BL_MODEL__PAYOUT__BACKEND=tabpfn_client`.
 
+The precedence is worth stating, because two reasonable rules compete. A bundle
+records the backend it was built with, so rolling back to an older version brings that
+version's backend with it rather than whatever the current config says. But an operator
+who sets the variable is making a decision, and that wins over the bundle. So: explicit
+override first, then the bundle's own backend, then the config default. `GET /model`
+reports which one is actually in use.
+
 Two smaller things worth knowing: TabPFN sends usage telemetry to a third party by
 default (`TABPFN_DISABLE_TELEMETRY=1` turns it off, and the serving image sets it), and
 the hosted client uploads the in-context rows — real leads, with name-derived and

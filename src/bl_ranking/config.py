@@ -217,6 +217,22 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text()) or {}
 
 
+def env_override_keys() -> frozenset[str]:
+    """Dotted key paths currently set as BL_ environment variables.
+
+    Lets a caller tell "this setting holds its default" from "an operator asked for
+    this", which the merged Settings object cannot express on its own - both arrive as
+    the same plain value. Serving needs the distinction to honour an explicit backend
+    override while still letting a rolled-back bundle carry its own.
+    """
+    keys = set()
+    for key, value in os.environ.items():
+        if not key.startswith(ENV_PREFIX) or key == "BL_CONFIG" or value == "":
+            continue
+        keys.add(".".join(key[len(ENV_PREFIX):].lower().split(NESTING_SEPARATOR)))
+    return frozenset(keys)
+
+
 def _env_overrides() -> dict[str, Any]:
     """Turn BL_SERVING__WORKERS=2 into {'serving': {'workers': '2'}}.
 
