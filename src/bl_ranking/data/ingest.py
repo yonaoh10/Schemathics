@@ -122,9 +122,11 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     digits = raw_phone.astype(str).str.replace(r"\D", "", regex=True)
     # Strip a leading US country code so '+1 786...' and '786...' give the same prefix.
     digits = digits.mask(digits.str.len() == 11, digits.str[1:])
-    numeric = pd.to_numeric(digits, errors="coerce")
-    repairs["cellphone"] = int(numeric.isna().sum())
-    frame["cellphone"] = numeric.fillna(0).astype("int64")
+    parsed_phone = _exact_int64_column(digits)
+    # Counts unparseable AND out-of-int64 numbers. The previous to_numeric route let a
+    # 20-digit value wrap to INT64_MIN while reporting zero repairs.
+    repairs["cellphone"] = int(parsed_phone.isna().sum())
+    frame["cellphone"] = parsed_phone.where(parsed_phone.notna(), 0).astype("int64")
 
     # 2. Survey columns must expose the .str accessor. A column that happens to be all
     #    null arrives as float64 and would raise on .str.lower().
@@ -166,9 +168,9 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     #    Converting from the text form preserves every digit; converting from a float
     #    that pandas already rounded cannot.
     if "campaign_id" in frame.columns:
-        campaign = pd.to_numeric(frame["campaign_id"], errors="coerce")
+        campaign = _exact_int64_column(frame["campaign_id"])
         repairs["campaign_id"] = int(campaign.isna().sum())
-        frame["campaign_id"] = campaign.fillna(0).astype("int64")
+        frame["campaign_id"] = campaign.where(campaign.notna(), 0).astype("int64")
 
     # Timestamps are normalised to ISO strings so the Delta round trip reproduces
     # exactly what pd.read_csv would have handed the research code.
@@ -183,6 +185,58 @@ def sanitise(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
 
     return frame, repairs
 
+
+
+INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
+
+
+def _as_int64(value: object) -> int | None:
+    """Parse an id to an exact int64, or None if it cannot be one.
+
+    `pd.to_numeric` is the obvious way to do this and it is wrong here. It picks one
+    dtype for the whole column, so a single value that does not fit int64 demotes every
+    other value to float64 - and 120227360861540306, a real campaign id, comes back as
+    120227360861540304. One bad row silently corrupts the column it shares, which is
+    the precise failure this gate exists to prevent.
+
+    Parsing value by value keeps every id that is representable exact, and isolates the
+    ones that are not so they can be counted as repairs instead of wrapping to
+    INT64_MIN.
+    """
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # '120227360861540306.0' is the same id as '120227360861540306', and going via
+    # float to find that out would round it. Strip the suffix textually instead.
+    if text.endswith(".0") and text[:-2].lstrip("-").isdigit():
+        text = text[:-2]
+    try:
+        parsed = int(text)
+    except ValueError:
+        try:
+            # '1.2e17' still has to go through a float; nothing else can read it.
+            as_float = float(text)
+        except (ValueError, OverflowError):
+            return None
+        if as_float != as_float or as_float in (float("inf"), float("-inf")):
+            return None
+        parsed = int(as_float)
+    return parsed if INT64_MIN <= parsed <= INT64_MAX else None
+
+
+def _exact_int64_column(values: pd.Series) -> pd.Series:
+    """Parse a column of ids to exact int64, keeping every representable value.
+
+    Built as an object Series on purpose. `Series.map` infers its own dtype, and a
+    single None among large integers is enough for it to choose float64 - which
+    reintroduces the very rounding this function exists to avoid, one level up from
+    `pd.to_numeric`. Holding Python ints in an object column defers the cast until
+    after the nulls have been filled, so nothing ever passes through a float.
+    """
+    parsed = pd.Series([_as_int64(v) for v in values], index=values.index, dtype=object)
+    return parsed
 
 def _as_identifier(value: object) -> str | None:
     """Render an attribution id the way a JSON request would: no trailing '.0'.

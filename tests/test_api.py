@@ -218,3 +218,24 @@ def test_a_quoted_campaign_id_keeps_every_digit(client):
     # Junk degrades to the same 0 level the ingestion gate assigns it, not a 500.
     assert RankRequest(**(dict(WARMUP_USER) | {"campaign_id": "junk"})).campaign_id == 0
 
+@pytest.mark.parametrize("value", ["9999-12-31 23:59:59", "1600-01-01 00:00:00"])
+def test_timestamps_outside_the_representable_range_are_rejected(client, value):
+    """Both feature paths must agree, including on what they refuse.
+
+    pandas holds timestamps as nanoseconds in an int64, so a year outside roughly
+    1677..2262 has no representation. The research path died inside CatBoost on such a
+    row while the vectorised path scored it and returned a confident ranking - a
+    divergence in the one contract the two paths have.
+    """
+    response = client.post("/rank", json=dict(WARMUP_USER) | {"session_dt": value})
+    assert response.status_code == 422, response.text
+
+
+def test_an_oversized_phone_number_does_not_overflow(client):
+    """cellphone.astype(int) is an int64 cast; a 20-digit number used to raise there."""
+    from bl_ranking.serving.schemas import RankRequest
+
+    assert RankRequest(**(dict(WARMUP_USER) | {"cellphone": 99999999999999999999})).cellphone == 0
+    response = client.post("/rank", json=dict(WARMUP_USER) | {"cellphone": 99999999999999999999})
+    assert response.status_code == 200, response.text
+

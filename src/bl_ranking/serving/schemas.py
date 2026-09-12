@@ -24,9 +24,16 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _NON_DIGITS = re.compile(r"\D")
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 # The shape the research pipeline's pd.to_datetime reads without ambiguity.
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# What pandas can actually hold: datetime64[ns] is an int64 count of nanoseconds since
+# 1970. A margin is kept off each end so arithmetic on the value cannot overflow either.
+# Whole days, so the conversion carries no sub-microsecond remainder to discard.
+_TIMESTAMP_MIN = (pd.Timestamp.min + pd.Timedelta(days=1)).floor("D").to_pydatetime()
+_TIMESTAMP_MAX = (pd.Timestamp.max - pd.Timedelta(days=1)).floor("D").to_pydatetime()
 
 
 class RankRequest(BaseModel):
@@ -134,7 +141,16 @@ class RankRequest(BaseModel):
         digits = _NON_DIGITS.sub("", str(value))
         if len(digits) == 11 and digits.startswith("1"):
             digits = digits[1:]
-        return int(digits) if digits else 0
+        if not digits:
+            return 0
+        number = int(digits)
+        # The research pipeline does cellphone.astype(int) into an int64 column, so a
+        # number too large for one raised OverflowError there while the vectorised path
+        # scored it happily. Treat it as unparseable, which is what the ingestion gate
+        # now does with the same value.
+        if not (_INT64_MIN <= number <= _INT64_MAX):
+            return 0
+        return number
 
     def to_user_data(self) -> dict[str, Any]:
         """The dictionary shape the research predictor consumes."""
@@ -164,6 +180,17 @@ def _normalise_timestamp(value: Any, required: bool) -> str | None:
             return None
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    # pandas represents timestamps as nanoseconds since 1970 in an int64, so anything
+    # outside roughly 1677..2262 has no representation. The research feature path dies
+    # inside CatBoost on such a row while the vectorised path scores it and returns a
+    # confident ranking - the two paths are contractually identical, so the input has
+    # to be refused at the door rather than resolved differently by each.
+    naive = parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+    if not (_TIMESTAMP_MIN <= naive <= _TIMESTAMP_MAX):
+        raise ValueError(
+            f"{value!r} is outside the representable timestamp range "
+            f"({_TIMESTAMP_MIN:%Y-%m-%d}..{_TIMESTAMP_MAX:%Y-%m-%d})"
+        )
     return parsed.strftime(TIMESTAMP_FORMAT)
 
 

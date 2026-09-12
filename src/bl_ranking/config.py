@@ -42,6 +42,11 @@ def _default_config_path() -> Path:
 
 DEFAULT_CONFIG = _default_config_path()
 
+# The two feature implementations, and the payout backends that exist. Kept here so a
+# typo in either is a start-up error naming the alternatives, not a silent default.
+FEATURE_PATHS = frozenset({"fast", "research"})
+PAYOUT_BACKENDS = frozenset({"surrogate", "tabpfn_client", "tabpfn_local", "catboost_fallback"})
+
 ENV_PREFIX = "BL_"
 NESTING_SEPARATOR = "__"
 
@@ -151,7 +156,49 @@ class Settings:
         raw = _read_yaml(Path(config_path) if config_path else _default_config_path())
         _merge(raw, _env_overrides())
         _merge(raw, overrides)
-        return _build(cls, raw)
+        settings = _build(cls, raw)
+        settings.validate()
+        return settings
+
+    def validate(self) -> None:
+        """Refuse a configuration that cannot work, at start-up rather than in traffic.
+
+        Types are already enforced by `_build`; this is about values a correct type can
+        still hold. Each of these was reachable and silent: zero or negative workers,
+        a port outside the legal range, a payout backend that does not exist, and a
+        feature path that is not one of the two implementations - the last of which
+        simply meant "fast" while `GET /model` reported the bogus name back as though
+        it were in use.
+        """
+        if self.serving.workers < 1:
+            raise ValueError(f"serving.workers must be at least 1, got {self.serving.workers}")
+        if self.serving.threads_per_worker < 1:
+            raise ValueError(
+                f"serving.threads_per_worker must be at least 1, "
+                f"got {self.serving.threads_per_worker}"
+            )
+        if not 1 <= self.serving.port <= 65535:
+            raise ValueError(f"serving.port must be 1..65535, got {self.serving.port}")
+        if self.serving.feature_path not in FEATURE_PATHS:
+            raise ValueError(
+                f"serving.feature_path must be one of {sorted(FEATURE_PATHS)}, "
+                f"got {self.serving.feature_path!r}"
+            )
+        if self.model.payout.backend not in PAYOUT_BACKENDS:
+            raise ValueError(
+                f"model.payout.backend must be one of {sorted(PAYOUT_BACKENDS)}, "
+                f"got {self.model.payout.backend!r}"
+            )
+        if self.model.payout.teacher not in PAYOUT_BACKENDS:
+            raise ValueError(
+                f"model.payout.teacher must be one of {sorted(PAYOUT_BACKENDS)}, "
+                f"got {self.model.payout.teacher!r}"
+            )
+        if self.model.payout.context_size < 1:
+            raise ValueError(
+                f"model.payout.context_size must be at least 1, "
+                f"got {self.model.payout.context_size}"
+            )
 
     def flat(self, prefix: str = "") -> dict[str, Any]:
         """Dotted key/value view, used to log the whole config as MLflow params."""
@@ -171,25 +218,45 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def _env_overrides() -> dict[str, Any]:
-    """Turn BL_SERVING__WORKERS=2 into {'serving': {'workers': 2}}."""
+    """Turn BL_SERVING__WORKERS=2 into {'serving': {'workers': '2'}}.
+
+    Values stay as strings. They used to be run through `yaml.safe_load`, which is a
+    guess rather than a conversion and got three things wrong that all failed silently:
+    YAML 1.1 reads a leading zero as octal, so `030` meant 24 days rather than 30; any
+    value containing ": " became a dict, so an experiment name like "a: b" replaced a
+    string with `{'a': 'b'}`; and anything unrecognised was accepted verbatim, so
+    `workers=many` reached uvicorn as the string it was. `_build` now converts each
+    value to the type its field actually declares, which is the only place that
+    information exists.
+    """
     out: dict[str, Any] = {}
     for key, value in os.environ.items():
-        if not key.startswith(ENV_PREFIX) or value == "":
+        if not key.startswith(ENV_PREFIX) or key == "BL_CONFIG":
             continue
         parts = key[len(ENV_PREFIX):].lower().split(NESTING_SEPARATOR)
         cursor = out
-        for part in parts[:-1]:
+        for index, part in enumerate(parts[:-1]):
+            existing = cursor.get(part)
+            if existing is not None and not isinstance(existing, dict):
+                prefix = ENV_PREFIX + NESTING_SEPARATOR.join(parts[: index + 1]).upper()
+                raise ValueError(
+                    f"{key} cannot be applied: {prefix} is also set as a value, so one "
+                    f"of the two has to go. Nesting a key inside a scalar used to raise "
+                    f"TypeError at import and take the process down."
+                )
             cursor = cursor.setdefault(part, {})
-        cursor[parts[-1]] = _coerce(value)
+        leaf = parts[-1]
+        if isinstance(cursor.get(leaf), dict):
+            # The same clash seen from the other side: BL_MODEL__PAYOUT__BACKEND was
+            # read first and created the block that BL_MODEL__PAYOUT now wants to
+            # replace with a string. Environment order decides which side you hit, so
+            # both have to be refused or the failure is intermittent.
+            raise ValueError(
+                f"{key} cannot be applied: settings nested under it are also set "
+                f"individually, so one of the two has to go."
+            )
+        cursor[leaf] = value
     return out
-
-
-def _coerce(value: str) -> Any:
-    """YAML-parse scalars so BL_..._WORKERS=2 arrives as an int, not '2'."""
-    try:
-        return yaml.safe_load(value)
-    except yaml.YAMLError:
-        return value
 
 
 def _merge(base: dict[str, Any], extra: dict[str, Any]) -> None:
@@ -200,11 +267,14 @@ def _merge(base: dict[str, Any], extra: dict[str, Any]) -> None:
             base[key] = value
 
 
-def _build(cls: type, raw: dict[str, Any]) -> Any:
+def _build(cls: type, raw: dict[str, Any], path: str = "") -> Any:
     """Instantiate a nested dataclass tree from plain dicts, ignoring unknown keys.
 
     Field types are strings here (`from __future__ import annotations`), so nested
     blocks are detected from each field's *default value* rather than its annotation.
+    That default is also what says how to read an environment override: this is the one
+    place that knows a setting is meant to be an int rather than whatever a string
+    happens to parse as.
     """
     instance = cls()
     for f in fields(cls):
@@ -212,11 +282,58 @@ def _build(cls: type, raw: dict[str, Any]) -> Any:
             continue
         value = raw[f.name]
         current = getattr(instance, f.name)
+        where = f"{path}.{f.name}" if path else f.name
         if is_dataclass(current) and isinstance(value, dict):
-            setattr(instance, f.name, _build(type(current), value))
+            setattr(instance, f.name, _build(type(current), value, where))
         else:
-            setattr(instance, f.name, value)
+            setattr(instance, f.name, _as_field_type(value, current, where, f.type))
     return instance
+
+
+def _as_field_type(value: Any, default: Any, where: str, annotation: Any = None) -> Any:
+    """Convert an override to the type its field declares, or say why it cannot be.
+
+    Only strings are converted, so values read from the YAML file - already typed by
+    the parser - pass through untouched. A bad value raises here, naming the setting,
+    rather than travelling into the service as the wrong type and failing somewhere
+    that gives no clue which variable caused it.
+    """
+    if not isinstance(value, str) or isinstance(default, str):
+        return value
+    text = value.strip()
+    if isinstance(default, bool):
+        if text.lower() in {"1", "true", "yes", "on"}:
+            return True
+        if text.lower() in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"{where}: expected a boolean, got {value!r}")
+    if isinstance(default, int):
+        try:
+            # Base 10 explicitly: a leading zero is a typo, never octal.
+            return int(text, 10)
+        except ValueError:
+            raise ValueError(f"{where}: expected an integer, got {value!r}") from None
+    if isinstance(default, float):
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError(f"{where}: expected a number, got {value!r}") from None
+    if default is None:
+        # Nullable settings: an explicit empty value means "unset".
+        if text == "":
+            return None
+        # A default of None says nothing about the type, so read the annotation. With
+        # `from __future__ import annotations` it is the source string, e.g.
+        # "int | None" - enough to tell a nullable number from a nullable path.
+        declared = str(annotation or "")
+        if "bool" in declared:
+            return _as_field_type(text, True, where)
+        if "int" in declared:
+            return _as_field_type(text, 0, where)
+        if "float" in declared:
+            return _as_field_type(text, 0.0, where)
+        return text
+    return value
 
 
 def _flatten(node: Any, prefix: str = "") -> dict[str, Any]:

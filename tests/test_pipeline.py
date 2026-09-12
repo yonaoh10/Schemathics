@@ -465,3 +465,40 @@ def test_a_healthy_bundle_passes_the_consistency_check(bundle, settings):
 
     assert BrandRanker.load(bundle, settings) is not None
 
+def test_one_unrepresentable_id_does_not_corrupt_the_rest_of_its_column():
+    """The gate must not round a real id because another row is malformed.
+
+    `pd.to_numeric` chooses one dtype for the whole column, so a single value too large
+    for int64 demoted every other value to float64 - and 120227360861540306, a real
+    campaign id, came back as 120227360861540304 while the repair counters reported
+    nothing. One bad row silently corrupted the column it shared, which is the exact
+    failure this gate exists to prevent.
+    """
+    import pandas as pd
+
+    from bl_ranking.data.ingest import sanitise
+
+    exact = 120227360861540306
+    frame = pd.DataFrame({
+        "campaign_id": ["999999999999999999999999", str(exact), f"{exact}.0"],
+        "cellphone": ["99999999999999999999", "7869914030", "(305) 555-0142"],
+        "payout": [0] * 3,
+        "session_dt": ["2026-01-06 19:24:22"] * 3,
+        "conversion_dt": [None] * 3, "register_date": [None] * 3,
+        **{c: ["x"] * 3 for c in ["credit_score", "industry", "loan_amount", "loan_reason",
+                                  "monthly_revenue", "time_in_business", "device_type",
+                                  "business_type"]},
+    })
+    cleaned, repairs = sanitise(frame)
+
+    ids = cleaned["campaign_id"].tolist()
+    assert ids[1] == exact, "a well-formed id was rounded by a malformed sibling"
+    assert ids[2] == exact, "the '.0' form must resolve to the same id"
+    assert ids[0] == 0, "an unrepresentable id becomes the 0 level"
+    assert repairs["campaign_id"] == 1, "the repair must be counted, not silent"
+
+    phones = cleaned["cellphone"].tolist()
+    assert phones[0] == 0, "an oversized phone number used to wrap to INT64_MIN"
+    assert phones[1] == 7869914030
+    assert repairs["cellphone"] == 1
+
