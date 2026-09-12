@@ -94,6 +94,12 @@ def parse_quartz(expression: str) -> CronFields:
 # accept the same three-letter names, so numbers are translated into names and the
 # ambiguity disappears.
 _QUARTZ_DAY_NUMBERS = {1: "sun", 2: "mon", 3: "tue", 4: "wed", 5: "thu", 6: "fri", 7: "sat"}
+_QUARTZ_DAY_BY_NAME = {name: number for number, name in _QUARTZ_DAY_NUMBERS.items()}
+
+# APScheduler's own order, which is where the two systems disagree: Quartz starts the
+# week on Sunday, APScheduler ends it there. So a range's *edges* cannot simply be
+# translated - the set of days has to be translated and then re-expressed.
+_APSCHEDULER_DAY_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 def _translate_day_of_week(field: str) -> str:
@@ -117,9 +123,42 @@ def _translate_day_of_week(field: str) -> str:
             raise ValueError(f"{field!r} is not a Quartz day-of-week: {token!r}")
         return name
 
-    # Lists and ranges, e.g. '2-6' (Quartz MON-FRI) or 'MON,WED'.
-    return ",".join("-".join(one(edge) for edge in part.split("-"))
-                    for part in text.split(","))
+    def days_in(part: str) -> list[str]:
+        """The days one comma-separated part selects, as names.
+
+        A Quartz range runs in Quartz's week, so it may wrap: '6-2' is FRI,SAT,SUN,MON.
+        Translating the two edges and handing 'fri-mon' to APScheduler gets "The minimum
+        value in a range must not be higher than the maximum" - which names neither the
+        cron expression nor the setting it came from. Worse, because Sunday is 1 in
+        Quartz and last in APScheduler, *every* range starting on Sunday wrapped: the
+        ordinary Quartz weekday range '1-5' took the local runner down on start-up
+        while Databricks accepted it happily. So walk the range in Quartz's week and
+        collect the days themselves.
+        """
+        edges = part.split("-")
+        if len(edges) == 1:
+            return [one(edges[0])]
+        if len(edges) != 2:
+            raise ValueError(f"{field!r} is not a Quartz day-of-week: {part!r}")
+        start, end = (_QUARTZ_DAY_BY_NAME[one(edge)] for edge in edges)
+        walked, day = [], start
+        while True:
+            walked.append(_QUARTZ_DAY_NUMBERS[day])
+            if day == end:
+                return walked
+            day = day % 7 + 1
+
+    selected = {name for part in text.split(",") for name in days_in(part)}
+    ordered = [name for name in _APSCHEDULER_DAY_ORDER if name in selected]
+
+    # Kept as a range when the days happen to be contiguous in APScheduler's week, both
+    # because it is what an operator wrote and because it reads back as one thing.
+    # Otherwise an explicit list, which has no ordering to get wrong.
+    first = _APSCHEDULER_DAY_ORDER.index(ordered[0])
+    last = _APSCHEDULER_DAY_ORDER.index(ordered[-1])
+    if len(ordered) > 1 and last - first + 1 == len(ordered):
+        return f"{ordered[0]}-{ordered[-1]}"
+    return ",".join(ordered)
 
 
 def run_scheduler(settings: Settings | None = None, run_now: bool = False) -> None:

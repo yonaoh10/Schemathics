@@ -67,8 +67,12 @@ train-prod: ingest
 # same ordering the Databricks job uses.
 all: train-prod train
 
+# BACKEND is passed through only when it was asked for on the command line. Serving
+# otherwise reads the backend out of the bundle it loaded, which is what lets a rollback
+# carry the backend its version was trained with; setting the variable unconditionally
+# made that unreachable. `make serve BACKEND=surrogate` still overrides it.
 serve:
-	BL_SERVING__PORT=$(PORT) BL_MODEL__PAYOUT__BACKEND=$(BACKEND) ./scripts/serve.sh
+	BL_SERVING__PORT=$(PORT) 	$(if $(filter command line,$(origin BACKEND)),BL_MODEL__PAYOUT__BACKEND=$(BACKEND),) 	./scripts/serve.sh
 
 # Sweep rather than a single rate: the point at which achieved rps falls behind the
 # target is the capacity number, and a single point cannot show it.

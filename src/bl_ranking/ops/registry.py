@@ -97,14 +97,20 @@ def set_alias(settings: Settings, version: str, alias: str | None = None) -> dic
     # Keep a breadcrumb to the version being replaced, so an accidental rollback is
     # itself reversible without reading the run history.
     #
-    # Compared as strings on purpose: MLflow returns `.version` as a string while the
-    # caller may hold an int, and "3" != 3 is always true. That made the guard never
-    # fire, so re-running the same rollback pointed champion_previous at the version
-    # being rolled back *to* - overwriting the only pointer back to the one being
-    # replaced, which is exactly the reversibility this breadcrumb exists to provide.
-    if previous is not None and str(previous) != str(version):
+    # Compared against the *resolved* version, as strings.
+    #
+    # Strings because MLflow returns `.version` as one while the caller may hold an int,
+    # and "3" != 3 is always true. Resolved because the caller's spelling is not the
+    # version: `make rollback VERSION=02` and a version with stray whitespace both reach
+    # the registry, which resolves them, while the guard was still comparing the text
+    # typed on the command line. Either way the guard did not fire, and re-running the
+    # same rollback pointed champion_previous at the version being rolled back *to* -
+    # destroying the only pointer back to the one being replaced, which is the entire
+    # reason this breadcrumb exists.
+    resolved = str(target.version)
+    if previous is not None and str(previous) != resolved:
         client.set_registered_model_alias(name, f"{alias}_previous", previous)
-    client.set_registered_model_alias(name, alias, str(version))
+    client.set_registered_model_alias(name, alias, resolved)
 
     return {"model": name, "alias": alias, "from": previous, "to": target.version,
             "run_id": target.run_id}

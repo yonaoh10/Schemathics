@@ -24,6 +24,7 @@ answerable without guessing.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -35,6 +36,8 @@ from bl_ranking.config import Settings, resolve
 log = logging.getLogger("bl_ranking.serving")
 
 BUNDLE_ARTIFACT_PATH = "bundle"
+# A URI scheme as RFC 3986 spells it. A POSIX path cannot match at position 0.
+_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*):")
 _MODELS_URI = re.compile(r"^models:/(?P<name>[^/@]+)(?:@(?P<alias>.+)|/(?P<version>\d+))$")
 
 
@@ -48,7 +51,7 @@ def resolve_bundle(settings: Settings) -> Path:
     try:
         return _from_uri(default_uri, settings)
     except Exception as exc:  # noqa: BLE001 - classified below
-        if _registry_is_authoritative(settings):
+        if _registry_is_authoritative(settings) and not _alias_is_unset(exc):
             # The local fallback picks the NEWEST bundle on disk, which after a rollback
             # is precisely the version the operator rolled back from. Falling back here
             # would silently undo their decision and report the worker healthy while
@@ -67,6 +70,40 @@ def resolve_bundle(settings: Settings) -> Path:
         return _latest_local_bundle(settings)
 
 
+def _alias_is_unset(exc: BaseException) -> bool:
+    """True when the registry answered, and what it said is that the alias is not set.
+
+    "Unreachable" and "nothing promoted yet" are different situations and were treated
+    the same, which made the documented local stack unstartable: bring up
+    `docker compose up`, and the API refuses to serve the bundle sitting in runs/
+    because `models:/bl_rank@champion` does not resolve - so it never becomes ready, and
+    the first `make train-prod` cannot be reached through it.
+
+    The difference matters because the refusal exists to protect an operator's decision.
+    An alias that was never set records no decision, so serving a local bundle
+    contradicts nothing. An unreachable registry may be hiding a rollback, and there the
+    refusal stands.
+
+    Read off the failure that already happened, rather than by asking the registry a
+    second question: an unreachable one retries with backoff, so a probe would double how
+    long a worker takes to report the refusal it is going to report anyway.
+
+    Only the two codes a registry uses to say "not there" count - MLflow answers a
+    missing alias with INVALID_PARAMETER_VALUE, an unreachable one with INTERNAL_ERROR.
+    Anything unrecognised, including a code a future version renames, falls through to
+    the refusal, which is the safe direction: the cost of refusing when the alias was
+    merely unset is a 503 an operator can explain, and the cost of falling back when a
+    rollback is in force is silently serving the version they rejected.
+    """
+    from mlflow.exceptions import MlflowException
+
+    if not isinstance(exc, MlflowException):
+        return False
+    return getattr(exc, "error_code", "") in {
+        "RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE",
+    }
+
+
 def _registry_is_authoritative(settings: Settings) -> bool:
     """True unless this process is pointed at a plain directory of files.
 
@@ -81,18 +118,40 @@ def _registry_is_authoritative(settings: Settings) -> bool:
     list is the part that goes stale: an earlier version named http, https and
     databricks, which silently left the rollback-undoing fallback live for every
     postgresql://, mysql:// and sqlite:// registry - the ordinary production setups.
+
+    Both URIs are consulted, and either one being administered is enough. MLflow lets
+    the registry live somewhere other than the tracking store (MLFLOW_REGISTRY_URI), and
+    the registry is the thing that holds the alias - so reading only the tracking URI
+    left the fallback live for exactly the setup where the alias is furthest away.
     """
-    uri = str(settings.mlflow.resolved_tracking_uri()).strip()
+    return any(_is_administered(uri) for uri in _registry_uris(settings))
+
+
+def _registry_uris(settings: Settings) -> tuple[str, ...]:
+    """Every URI that could be holding the registry, in no particular order."""
+    return (
+        str(settings.mlflow.resolved_tracking_uri() or "").strip(),
+        os.environ.get("MLFLOW_REGISTRY_URI", "").strip(),
+    )
+
+
+def _is_administered(uri: str) -> bool:
+    """True unless this URI names a plain directory of files."""
     if not uri:
         return False
-    # MLflow's Databricks URIs are the one form with no scheme separator: the literal
-    # "databricks", or "databricks://<profile>".
-    if uri.lower() == "databricks" or uri.lower().startswith("databricks:"):
+    lowered = uri.lower()
+    # The Databricks family, which is the only one that may carry no scheme separator:
+    # "databricks", "databricks://<profile>", and Unity Catalog's "databricks-uc" forms.
+    # Matched by prefix, because "databricks-uc" on its own was read as a relative path.
+    if lowered.startswith("databricks"):
         return True
-    scheme, separator, _ = uri.partition("://")
-    if not separator:
+    # `scheme:`, not `scheme://`. A single-slash typo - `http:/mlflow:5000` - is not a
+    # directory either, and treating it as one silently re-enabled the fallback on a
+    # deployment whose operator plainly meant a server.
+    match = _URI_SCHEME.match(uri)
+    if match is None:
         return False          # a bare path is a local directory
-    return scheme.lower() != "file"
+    return match.group("scheme").lower() != "file"
 
 
 def _from_uri(uri: str, settings: Settings) -> Path:
