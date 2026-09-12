@@ -1163,21 +1163,34 @@ def test_an_id_the_round_trip_would_change_stops_the_run(tmp_path):
 
 
 def test_the_ingest_report_reaches_the_training_run(tmp_path):
-    """Ingestion and training are separate jobs, so the repair counters have to be
-    persisted against the Delta version or the run cannot report the quality of the
-    rows it trained on. `as_params` had no caller at all before this."""
+    """Ingestion and training are separate jobs, so the repair counters have to travel
+    with the Delta version or the run cannot report the quality of the rows it trained
+    on. `as_params` had no caller at all before this.
+
+    Carried in the commit rather than in a file beside the table: atomic with the version
+    it describes, and present on object storage and Unity Catalog, where a local sibling
+    directory would not exist at all.
+    """
+    from bl_ranking.data.delta import write_snapshot
     from bl_ranking.data.ingest import IngestReport, read_report
 
     table = tmp_path / "delta" / "bl_sessions"
-    report = IngestReport(source="/x/bl_full_data.csv", rows_in=10, rows_out=9,
-                          delta_version=3, repairs={"cellphone": 2})
-    report.save(table)
+    for index in range(2):
+        report = IngestReport(source="/x/bl_full_data.csv", rows_in=10 + index,
+                              rows_out=9, repairs={"cellphone": 2 + index})
+        version = write_snapshot(pd.DataFrame({"a": [index]}), table,
+                                 commit_metadata=report.as_commit_metadata())
 
-    loaded = read_report(table, 3)
+    loaded = read_report(table, version)
     assert loaded is not None
-    assert loaded.as_params()["ingest.repaired.cellphone"] == 2
-    assert loaded.as_params()["ingest.rows_out"] == 9
-    assert read_report(table, 4) is None       # a version this gate did not write
+    assert loaded.as_params()["ingest.repaired.cellphone"] == 3
+    assert loaded.as_params()["ingest.rows_in"] == 11
+    assert loaded.as_params()["ingest.delta_version"] == version
+    # An older version keeps its own counters, not the newest ones.
+    assert read_report(table, 0).as_params()["ingest.repaired.cellphone"] == 2
+    # A version written without the gate carries none, which is an ordinary answer.
+    plain = write_snapshot(pd.DataFrame({"a": [9]}), table)
+    assert read_report(table, plain) is None
 
 
 def test_a_brand_universe_of_only_the_sentinel_is_refused(tmp_path):
@@ -1407,3 +1420,59 @@ def test_a_numeric_timestamp_column_is_refused():
     clean, _ = sanitise(_gate_frame(
         rows=3, register_date=pd.Series([np.nan] * 3, dtype="float64")))
     assert clean["register_date"].isna().all()
+
+
+def test_a_blank_attribution_id_is_an_absent_one(tmp_path):
+    """An empty tracking parameter reaches the CSV as an empty cell, which pandas reads as
+    null and the research code's `fillna('Other')` turns into 'Other' - and serving's
+    mirror does the same with None. Returning '' put an empty level in training against
+    'Other' at serve time, and once the staged round trip was checked it stopped the
+    weekly run outright over a blank sub parameter, which is ordinary attribution data."""
+    from bl_ranking.data.ingest import (
+        RESEARCH_NULL_CATEGORY,
+        _as_identifier,
+        sanitise,
+        stage_for_research_code,
+    )
+    from bl_ranking.serving.schemas import RankRequest
+
+    assert _as_identifier("") is None
+    assert _as_identifier("   ") is None
+
+    clean, _ = sanitise(_gate_frame(rows=3, sub1=["", "7448788", "  "]))
+    stage_dir, filename = stage_for_research_code(clean, tmp_path / "input")
+    reread = pd.read_csv(stage_dir / filename)
+    assert list(reread["sub1"].fillna(RESEARCH_NULL_CATEGORY).astype(str)) == [
+        "Other", "7448788", "Other"]
+
+    # And the request boundary agrees, because it imports the same function.
+    example = {"session_id": "s", "page": "p", "campaign_id": 1,
+               "session_dt": "2026-01-06 19:24:22", "register_date": "2026-01-06 19:26:07",
+               "credit_score": "550-599", "industry": "construction",
+               "loan_amount": "a1", "loan_reason": "b1", "monthly_revenue": "c1",
+               "time_in_business": "2+ years", "device_type": "mobile",
+               "business_type": "llc"}
+    assert RankRequest.model_validate({**example, "sub1": ""}).sub1 is None
+
+
+@pytest.mark.parametrize("expression", ["0 0 5 L * ? *", "0 0 5 15W * ? *", "0 0 5 LW * ? *"])
+def test_a_quartz_calendar_token_is_refused_here_not_by_apscheduler(expression):
+    """Databricks accepts L, W and #; APScheduler cannot express them. Passed through it
+    answered `Unrecognized expression "15W" for field "day"` when a worker started,
+    naming neither the cron nor the setting - and the real cost is that the two
+    schedulers would then disagree about when the weekly retrain runs."""
+    from bl_ranking.ops.schedule import parse_quartz
+
+    with pytest.raises(ValueError, match="calendar token"):
+        parse_quartz(expression)
+
+
+@pytest.mark.parametrize("uri", ["C:/mlruns", "C:\\mlruns", "d:/data/delta"])
+def test_a_windows_drive_letter_is_a_directory_not_a_registry(settings, monkeypatch, uri):
+    """A one-letter scheme is a drive, and reading it as a remote store told a developer
+    on Windows that the registry was authoritative - refusing to serve their own bundle."""
+    from bl_ranking.serving.model_source import _registry_is_authoritative
+
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
+    assert _registry_is_authoritative(settings) is False

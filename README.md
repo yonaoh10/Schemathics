@@ -550,10 +550,12 @@ no request can match.
 The serving request schema applies the same normalisation to the same fields, which is
 what keeps the two sides consistent.
 
-Ingestion and training are separate jobs, so the counters are written next to the Delta
-table under the version they produced, and the training run reads the ones belonging to
-the snapshot it loaded. Without that the numbers existed only in the ingest process's
-output and no run could say anything about the quality of the rows it trained on.
+Ingestion and training are separate jobs, so the counters travel inside the Delta commit
+they produced, and the training run reads the ones belonging to the snapshot it loaded.
+Without that the numbers existed only in the ingest process's output and no run could say
+anything about the quality of the rows it trained on. In the commit rather than in a file
+beside the table: atomic with the version it describes, and present on object storage and
+Unity Catalog, where a local sibling directory would not exist at all.
 
 ---
 

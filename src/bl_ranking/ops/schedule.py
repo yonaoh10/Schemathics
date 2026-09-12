@@ -83,6 +83,22 @@ def parse_quartz(expression: str) -> CronFields:
     # Quartz requires exactly one of day-of-month / day-of-week to be '?'.
     # APScheduler has no '?', so it becomes '*'.
     day = "*" if day == "?" else day
+
+    # Quartz's calendar tokens - L (last), W (nearest weekday), # (nth weekday of the
+    # month) - have no APScheduler equivalent. Passed through, APScheduler answered
+    # `Unrecognized expression "15W" for field "day"`, which names neither the cron nor
+    # the setting it came from, and only when a worker started. Said here instead,
+    # because the failure mode that matters is a schedule Databricks accepts and the
+    # local runner cannot reproduce: the two would then disagree about when the weekly
+    # retrain happens, which is the one thing this translation exists to prevent.
+    unsupported = sorted({token for token in "LW#" if token in day.upper()})
+    if unsupported:
+        raise ValueError(
+            f"{expression!r} uses Quartz calendar token(s) {', '.join(unsupported)} in "
+            f"its day-of-month field ({day!r}). Databricks accepts those and the local "
+            f"APScheduler runner cannot express them, so the two would disagree about "
+            f"when the retrain runs. Use an explicit day, or schedule by day-of-week."
+        )
     day_of_week = "*" if day_of_week == "?" else _translate_day_of_week(day_of_week)
     return CronFields(second=second, minute=minute, hour=hour, day=day,
                       month=month, day_of_week=day_of_week)

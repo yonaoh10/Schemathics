@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from bl_ranking.config import Settings, resolve
+from bl_ranking.data import delta
 from bl_ranking.data.delta import write_snapshot
 
 # Columns bl_models_train.py selects in import_preprocess. Missing any of them is a
@@ -59,6 +60,9 @@ SURVEY_COLUMNS: list[str] = [
 # it fills them with (bl_models_train.py: `fillna('Other')` then `.astype(str)`).
 SUB_ID_COLUMNS = ("sub1", "sub2", "sub3")
 RESEARCH_NULL_CATEGORY = "Other"
+
+# Where the gate's report lives inside the Delta commit it produced.
+COMMIT_METADATA_KEY = "bl_ingest_report"
 
 # How pandas renames a repeated CSV header: the second `payout` becomes `payout.1`.
 _MANGLED_DUPLICATE = re.compile(r"(?P<base>.+)\.\d+")
@@ -95,60 +99,51 @@ class IngestReport:
         params.update({f"ingest.repaired.{k}": v for k, v in self.repairs.items()})
         return params
 
-    def save(self, table_uri: str | Path) -> Path | None:
-        """Persist the report beside the table, keyed by the version it produced.
+    def as_commit_metadata(self) -> dict[str, str]:
+        """The counters, as one JSON value to ride along in the Delta commit.
 
-        Ingestion and training are separate jobs - the weekly schedule runs the gate,
-        then the trainer reads a Delta *version*, not the CSV. Without this the repair
-        counters die with the ingest process and the training run cannot report the
-        quality of the data it just trained on. Written outside the table directory so
-        delta-rs never sees a file it did not put there.
+        Ingestion and training are separate jobs: the weekly schedule runs the gate, and
+        the trainer then reads a Delta *version*, not the CSV. Without carrying the
+        counters across, they die with the ingest process and no training run can report
+        the quality of the rows it trained on - which the module docstring above has
+        always claimed it does.
+
+        In the commit rather than in a file beside the table, so it is atomic with the
+        version it describes and so it works unchanged on object storage and Unity
+        Catalog, where a local sibling directory would not exist.
         """
-        directory = _report_dir(table_uri)
-        if directory is None:
-            return None
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"v{self.delta_version}.json"
-        payload = {
-            "source": self.source,
-            "rows_in": self.rows_in,
-            "rows_out": self.rows_out,
-            "delta_version": self.delta_version,
-            "repairs": self.repairs,
+        return {
+            COMMIT_METADATA_KEY: json.dumps({
+                "source": Path(self.source).name,
+                "rows_in": self.rows_in,
+                "rows_out": self.rows_out,
+                "repairs": self.repairs,
+            }, sort_keys=True)
         }
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        return path
-
-
-def _report_dir(table_uri: str | Path) -> Path | None:
-    """Sibling of the Delta table. None for a remote table, where a local sibling
-    directory would be meaningless (on Databricks the counters come from the job run)."""
-    text = str(table_uri)
-    if "://" in text and not text.startswith("file://"):
-        return None
-    return resolve(table_uri).parent / "ingest_reports"
 
 
 def read_report(table_uri: str | Path, version: int) -> IngestReport | None:
-    """The report for one Delta version, or None if it was not written by this gate."""
-    directory = _report_dir(table_uri)
-    if directory is None:
-        return None
-    path = directory / f"v{version}.json"
-    if not path.exists():
+    """The gate's report for one Delta version, or None if that commit carries none.
+
+    None is an ordinary answer: a snapshot written before this existed, or by something
+    other than the gate. The training run then simply carries no ingest.* params.
+    """
+    raw = delta.commit_metadata(table_uri, version, COMMIT_METADATA_KEY)
+    if raw is None:
         return None
     try:
-        payload = json.loads(path.read_text())
-    except (OSError, ValueError):
+        payload = json.loads(raw)
+    except ValueError:
         return None
     if not isinstance(payload, dict):
         return None
+    repairs = payload.get("repairs")
     return IngestReport(
         source=str(payload.get("source", "")),
         rows_in=int(payload.get("rows_in", 0)),
         rows_out=int(payload.get("rows_out", 0)),
-        delta_version=int(payload.get("delta_version", -1)),
-        repairs={str(k): int(v) for k, v in (payload.get("repairs") or {}).items()},
+        delta_version=int(version),
+        repairs={str(k): int(v) for k, v in (repairs or {}).items()},
     )
 
 
@@ -200,8 +195,8 @@ def ingest(settings: Settings | None = None, source: Path | None = None) -> Inge
             f"The Delta table was not written."
         )
 
-    report.delta_version = write_snapshot(frame, settings.paths.delta_table)
-    report.save(settings.paths.delta_table)
+    report.delta_version = write_snapshot(
+        frame, settings.paths.delta_table, commit_metadata=report.as_commit_metadata())
     return report
 
 
@@ -449,6 +444,14 @@ def _as_identifier(value: object) -> str | None:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     text = str(value).strip()
+    # A blank id is an absent id. An empty tracking parameter reaches the CSV as an empty
+    # cell, which pandas reads as null and the research code's own `fillna('Other')` then
+    # turns into 'Other' - and serving's mirror does the same with None. Returning '' here
+    # instead put an empty level in training against 'Other' at serve time, and once the
+    # staged round trip was being checked it stopped the weekly run outright over a blank
+    # sub parameter, which is ordinary attribution data.
+    if not text:
+        return None
     # '1815195.0' from a float-inferred column, and '1815195' from text, are the
     # same id and must produce the same category level.
     if text.endswith(".0") and text[:-2].lstrip("-").isdigit():

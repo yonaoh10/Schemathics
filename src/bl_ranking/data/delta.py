@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from deltalake import DeltaTable, write_deltalake
+from deltalake import CommitProperties, DeltaTable, write_deltalake
 
 from bl_ranking.config import resolve
 
@@ -38,17 +38,36 @@ class Snapshot:
 
 
 def write_snapshot(frame: pd.DataFrame, table_uri: str | Path,
-                   mode: str = "overwrite") -> int:
+                   mode: str = "overwrite",
+                   commit_metadata: dict[str, str] | None = None) -> int:
     """Write the frame and return the new table version.
 
     `overwrite` is right for this dataset: the upstream extract is a full dump of the
     two-month window, not an increment. Delta keeps the previous versions regardless,
     which is what gives us rollback.
+
+    `commit_metadata` rides along in the commit itself, which is how the gate's repair
+    counters reach the training run that later reads this version (see
+    data/ingest.read_report). Stored here rather than in a file beside the table because
+    it is then atomic with the version it describes, and because it works on object
+    storage and Unity Catalog - where a local sibling directory would not exist at all.
     """
     path = resolve(table_uri)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_deltalake(str(path), _typed_for_delta(frame), mode=mode, schema_mode="overwrite")
+    extra = ({"commit_properties": CommitProperties(custom_metadata=commit_metadata)}
+             if commit_metadata else {})
+    write_deltalake(str(path), _typed_for_delta(frame), mode=mode,
+                    schema_mode="overwrite", **extra)
     return DeltaTable(str(path)).version()
+
+
+def commit_metadata(table_uri: str | Path, version: int, key: str) -> str | None:
+    """One custom metadata value from the commit that produced `version`."""
+    for entry in DeltaTable(str(resolve(table_uri))).history():
+        if entry.get("version") == version:
+            value = entry.get(key)
+            return str(value) if value is not None else None
+    return None
 
 
 def _typed_for_delta(frame: pd.DataFrame) -> pd.DataFrame:

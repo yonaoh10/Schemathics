@@ -37,7 +37,10 @@ log = logging.getLogger("bl_ranking.serving")
 
 BUNDLE_ARTIFACT_PATH = "bundle"
 # A URI scheme as RFC 3986 spells it. A POSIX path cannot match at position 0.
-_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*):")
+# Two characters minimum, because a one-letter "scheme" is a Windows drive: C:/mlruns is
+# a local directory, and reading it as a remote store told a developer on Windows that the
+# registry was authoritative and refused to serve their own local bundle.
+_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]+):")
 _MODELS_URI = re.compile(r"^models:/(?P<name>[^/@]+)(?:@(?P<alias>.+)|/(?P<version>\d+))$")
 
 
