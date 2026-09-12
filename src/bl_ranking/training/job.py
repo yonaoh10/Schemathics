@@ -35,10 +35,11 @@ from mlflow.tracking import MlflowClient
 
 from bl_ranking.config import REPO_ROOT, Settings, resolve
 from bl_ranking.data.delta import read_snapshot
-from bl_ranking.data.ingest import stage_for_research_code
+from bl_ranking.data.ingest import read_report, stage_for_research_code
 from bl_ranking.models import bundle as bundle_files
 from bl_ranking.models.gender_lut import ARTIFACT_NAME as GENDER_ARTIFACT
 from bl_ranking.models.gender_lut import GenderLookup
+from bl_ranking.ops import registry
 from bl_ranking.serving.pyfunc import (
     BUNDLE_ARTIFACT_KEY,
     BrandRankerModel,
@@ -154,6 +155,16 @@ def _params(settings: Settings, snapshot, backend: str | None,
         "lib.python": sys.version.split()[0],
     }
     params.update({f"cfg.{k}": v for k, v in settings.flat().items()})
+
+    # The gate's repair counters, carried across from the ingest job that produced this
+    # exact Delta version. This is what makes "a sudden jump in repairs is visible"
+    # true: without it the counters exist only in the ingest process's stdout, and a
+    # training run cannot say anything about the quality of the rows it trained on.
+    # Absent for a snapshot written before this was added, or by something other than
+    # the gate - in which case the run simply carries no ingest.* params.
+    ingest_report = read_report(snapshot.table_uri, snapshot.version)
+    if ingest_report is not None:
+        params.update(ingest_report.as_params())
     if backend:
         params["cfg.model.payout.backend"] = backend
     try:
@@ -298,9 +309,14 @@ def _register(bundle_dir: Path, settings: Settings) -> str:
 
     client = MlflowClient()
     version = _version_for(client, settings.mlflow.registered_model, info.run_id)
-    client.set_registered_model_alias(
-        settings.mlflow.registered_model, settings.mlflow.serving_alias, version,
-    )
+    # Promote through ops/registry.set_alias, not by writing the alias here.
+    #
+    # They are the same operation - "point champion at this version" - and writing the
+    # alias directly skipped the half of it that records `champion_previous`. So the
+    # documented way back existed only after a manual rollback had already been run,
+    # and pointed at whatever the operator had just rejected. A weekly retrain is
+    # exactly when an operator needs one command to undo it.
+    registry.set_alias(settings, version)
     manifest = bundle_files.Manifest.read(bundle_dir)
     for key, value in manifest.as_tags().items():
         client.set_model_version_tag(settings.mlflow.registered_model, version, key, value)

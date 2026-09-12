@@ -224,6 +224,16 @@ survive `.astype(int)` (a real number like `(305) 555-0142` raises); survey colu
 expose `.str`; `payout` must be numeric. Enforced once at ingestion, with every repair
 counted and logged so a jump is visible rather than silently changing a feature.
 
+Two of the three needed a second look, and both misses had the same shape: the gate was
+enforcing the invariant on its own copy of the frame rather than where the research code
+reads. `.str` is granted by a column's *values*, so casting an all-numeric column to
+`object` moved the dtype and left the accessor refusing — and reported a repair that had
+not happened. And the ids are re-inferred a second time when the staged CSV is read, so a
+digits-only column returns as `int64` however it was written; they are now canonicalised
+to the form that round trip produces, with the staged file re-read and compared before
+training begins. The lesson generalises: an invariant is only enforced at the point of
+use, and for this pipeline that point is two file boundaries away.
+
 **A response shape that cannot happen.** The documented
 `{"expected_payout": 0, "prob_lead": 0}` fallback is unreachable from the survey path.
 When `dropna(thresh=5)` empties a single user's frame, execution continues into

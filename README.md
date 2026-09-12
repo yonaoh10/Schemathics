@@ -351,6 +351,14 @@ who sets the variable is making a decision, and that wins over the bundle. So: e
 override first, then the bundle's own backend, then the config default. `GET /model`
 reports which one is actually in use.
 
+Which means no shipped way of starting the API may set that variable by default, and for
+a while every one of them did - the compose file and `make serve` both pinned
+`catboost_fallback`. The second tier was unreachable in practice: a rollback to a
+surrogate bundle would have been served by the fallback regressor, with a different
+ranking and nothing saying so. Both now leave it unset unless an operator asks
+(`make serve BACKEND=surrogate`, or `BL_PAYOUT_BACKEND` for compose), because a
+precedence rule no deployment can reach is documentation, not behaviour.
+
 Two smaller things worth knowing: TabPFN sends usage telemetry to a third party by
 default (`TABPFN_DISABLE_TELEMETRY=1` turns it off, and the serving image sets it), and
 the hosted client uploads the in-context rows — real leads, with name-derived and
@@ -526,8 +534,26 @@ Also enforced: `cellphone` must survive `.astype(int)`, survey columns must expo
 `.str` accessor, and `payout` must be numeric. Every repair is counted and logged to
 MLflow, so a jump in repairs is visible instead of quietly changing a feature.
 
+Two of those turned out to need more than one pass. `.str` is granted by the values a
+column holds and not by its dtype, so an object column of numeric survey codes still
+refuses it — the gate nulls those values, which is what the research code's own
+`.str.lower()` plus `fillna("other")` does with them anyway, and refuses an extract in
+which a whole survey question arrived empty, because that cannot be repaired into a
+readable column at all. And the ids have to survive a second boundary: the research code
+reads a staged CSV, where pandas re-infers dtypes, so an all-digit column comes back as
+`int64` however it was written. The ids are therefore canonicalised to the form that
+round trip produces (`'007'` → `'7'`), the request schema imports that same function
+rather than restating it, and the staged file is re-read and compared before training
+starts — an id that would not survive stops the run instead of becoming a category level
+no request can match.
+
 The serving request schema applies the same normalisation to the same fields, which is
 what keeps the two sides consistent.
+
+Ingestion and training are separate jobs, so the counters are written next to the Delta
+table under the version they produced, and the training run reads the ones belonging to
+the snapshot it loaded. Without that the numbers existed only in the ingest process's
+output and no run could say anything about the quality of the rows it trained on.
 
 ---
 
