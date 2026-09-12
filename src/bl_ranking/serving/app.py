@@ -79,9 +79,12 @@ state = ServiceState()
 async def lifespan(app: FastAPI):
     """Load the model before the first request, not during it."""
     settings = state.settings
-    _pin_threads(settings.serving.threads_per_worker)
     started = time.perf_counter()
     try:
+        # Inside the try: anything that raises before the model is loaded has to leave
+        # the worker reporting not-ready, rather than killing the process outside the
+        # one place that knows how to say so.
+        _pin_threads(settings.serving.threads_per_worker)
         bundle_dir = resolve_bundle(settings)
         state.bundle_dir = bundle_dir
         # BrandRanker.load() ends with a real scoring call; if it raises, this worker
@@ -177,6 +180,13 @@ def rank_bare(payload: RankRequest) -> ORJSONResponse:
     except (InsufficientSurveyData, MissingRegisterDate):
         REQUESTS.labels("insufficient_data").inc()
         return ORJSONResponse({}, status_code=422)
+    except Exception as exc:  # noqa: BLE001
+        # Without this the failure returned a bare 500 from the ASGI stack: the error
+        # counter never moved and nothing was logged, so an endpoint failing on every
+        # request looked identical to one nobody was calling.
+        REQUESTS.labels("error").inc()
+        log.exception("ranking failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     LATENCY.observe(time.perf_counter() - started)
     REQUESTS.labels("ok").inc()
     return ORJSONResponse(ranking)

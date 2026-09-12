@@ -47,10 +47,42 @@ def resolve_bundle(settings: Settings) -> Path:
     default_uri = f"models:/{settings.mlflow.registered_model}@{settings.mlflow.serving_alias}"
     try:
         return _from_uri(default_uri, settings)
-    except Exception as exc:  # noqa: BLE001 - registry unavailable is a normal dev case
-        log.warning("could not resolve %s (%s); falling back to the newest local run",
-                    default_uri, exc)
+    except Exception as exc:  # noqa: BLE001 - classified below
+        if _registry_is_authoritative(settings):
+            # The local fallback picks the NEWEST bundle on disk, which after a rollback
+            # is precisely the version the operator rolled back from. Falling back here
+            # would silently undo their decision and report the worker healthy while
+            # doing it. Where a tracking server is configured, the registry is the only
+            # thing that knows which version should be serving: if it cannot be reached,
+            # this worker has no business guessing. Failing keeps /readyz at 503 and the
+            # load balancer routes around it until the registry is back.
+            raise RuntimeError(
+                f"could not resolve {default_uri} ({exc}). A tracking server is "
+                f"configured, so the registry decides which version serves; refusing to "
+                f"fall back to a local bundle, which after a rollback would be the "
+                f"version that was rolled back from."
+            ) from exc
+        log.warning("could not resolve %s (%s); no tracking server is configured, so "
+                    "falling back to the newest local run", default_uri, exc)
         return _latest_local_bundle(settings)
+
+
+# Schemes that mean "a registry someone else administers", as opposed to a directory
+# of files sitting next to this process.
+_REMOTE_TRACKING_SCHEMES = ("http://", "https://", "databricks")
+
+
+def _registry_is_authoritative(settings: Settings) -> bool:
+    """True when this process is pointed at a tracking server rather than a local store.
+
+    The distinction is the whole point. A file store under the repository is the
+    offline development case the local fallback exists for, and pointing at one is
+    not a statement about which version should be serving. A tracking server is: its
+    alias is an operator's decision, so when it cannot be reached this worker has
+    nothing to fall back *to* that would not contradict that decision.
+    """
+    uri = str(settings.mlflow.resolved_tracking_uri()).strip().lower()
+    return uri.startswith(_REMOTE_TRACKING_SCHEMES)
 
 
 def _from_uri(uri: str, settings: Settings) -> Path:

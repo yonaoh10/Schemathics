@@ -577,3 +577,31 @@ def test_the_pyfunc_reports_errors_beside_the_ranking_not_inside_it(bundle, sett
     alone = model.predict(None, pd.DataFrame([good]))["ranking"][0]
     assert json.loads(alone) == json.loads(frame["ranking"][0])
 
+def test_an_unreachable_registry_does_not_undo_a_rollback(bundle, settings, monkeypatch):
+    """Falling back to the newest local bundle is the opposite of a rollback.
+
+    `_latest_local_bundle` picks the most recent run on disk, which immediately after
+    a rollback is the version the operator rolled back *from*. A worker restarting
+    during a brief registry outage would therefore quietly restore the bad model and
+    report itself healthy doing it.
+    """
+    import pytest
+
+    from bl_ranking.serving import model_source
+
+    def unreachable(uri, s):
+        raise ConnectionError("registry down")
+
+    monkeypatch.setattr(model_source, "_from_uri", unreachable)
+
+    # A deployment with a tracking server: the registry decides, so refuse to guess.
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+    with pytest.raises(RuntimeError, match="rolled back from"):
+        model_source.resolve_bundle(settings)
+
+    # Offline development has no registry to consult, so the documented fallback
+    # stands and resolves to the local bundle the fixture built.
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setattr(settings.mlflow, "tracking_uri", None, raising=False)
+    assert model_source.resolve_bundle(settings).exists()
+

@@ -239,3 +239,21 @@ def test_an_oversized_phone_number_does_not_overflow(client):
     response = client.post("/rank", json=dict(WARMUP_USER) | {"cellphone": 99999999999999999999})
     assert response.status_code == 200, response.text
 
+def test_an_unexpected_failure_on_the_bare_endpoint_is_counted(client, monkeypatch):
+    """/rank/bare had no catch-all, so failures were invisible to monitoring.
+
+    The bare 500 that the ASGI stack returned never touched the error counter and was
+    never logged, which makes an endpoint failing on every request indistinguishable
+    from one nobody is calling.
+    """
+    from bl_ranking.serving import app as app_module
+
+    def boom(_user):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_module.state.ranker, "rank", boom)
+    response = client.post("/rank/bare", json=dict(WARMUP_USER))
+
+    assert response.status_code == 500
+    assert 'bl_rank_requests_total{outcome="error"}' in client.get("/metrics").text
+
