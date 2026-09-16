@@ -71,15 +71,19 @@ def test_a_generator_that_keeps_up_is_not_flagged():
     assert summary["client_ms"]["p50"] == pytest.approx(9, abs=1)
 
 
-def test_achieved_rate_is_measured_over_the_offered_window():
-    """Dividing by the observed span let a long drain push the figure below target and a
-    late first arrival push it above - and that figure is what the capacity claim rests on.
+def test_achieved_rate_is_measured_over_the_whole_span_not_the_offered_window():
+    """A long drain has to push achieved below target, because the responses did not all
+    arrive inside the offered window - dividing by that window credits the server with the
+    drain. 500 responses whose last arrives 40 s after the 10 s window closed is 10 rps over
+    the 50 s span, not the 50 rps a window-only denominator would report. `span_s` is set
+    here on purpose: without it `summary()` falls back to `duration_s`, which makes both
+    denominators 10 s and lets a divide-by-the-window regression pass unnoticed.
     """
     result = Result(target_rps=100, duration_s=10, offered=1000)
-    # 500 responses, the last of them arriving 40 s after the 10 s window closed.
+    result.span_s = 50.0
     result.samples = [_sample(due=i / 100, sent=i / 100, finished=50.0)
                       for i in range(500)]
-    assert result.summary()["achieved_rps"] == 50.0
+    assert result.summary()["achieved_rps"] == 10.0
 
 
 def test_a_non_200_is_an_error_and_not_a_latency():
@@ -120,11 +124,40 @@ def test_a_payload_file_that_is_not_there_is_refused(tmp_path):
         load_payloads(empty, count=10)
 
 
+def test_a_payload_count_below_one_is_refused():
+    """An empty synthetic set reached _drive, where payloads[i % len(payloads)] is a
+    modulo by zero raised several arrivals in. Refused by name up front, like the empty
+    --payloads file, rather than as a ZeroDivisionError mid-run."""
+    with pytest.raises(SystemExit, match="payload-count must be at least 1"):
+        load_payloads(None, count=0)
+
+
+def test_the_table_rule_is_exactly_as_wide_as_the_header():
+    """The rule was a fixed 116 dashes under a 105-character header. Tied to the header's
+    own length now, so the two cannot drift when a column is added or widened."""
+    lines = render([]).splitlines()
+    header = next(ln for ln in lines if "verdict" in ln)
+    rule = next(ln for ln in lines if set(ln) == {"-"})
+    assert len(rule) == len(header)
+
+
 def test_the_built_in_payloads_are_distinct_users():
-    """One repeated user measures a perfectly cached code path."""
+    """One repeated user measures a perfectly cached code path.
+
+    Distinctness has to hold across the fields the model reads, not just the cellphone:
+    `cellphone` is a rolling integer, so 200 otherwise-identical users would pass a
+    byte-string check while still being one cached scoring path. Dropping it and requiring
+    variation in what remains is what makes this test able to fail.
+    """
     payloads = load_payloads(None, count=50)
     assert len(payloads) == 50
     assert len(set(payloads)) == 50
+    without_phone = set()
+    for payload in payloads:
+        user = json.loads(payload)
+        user.pop("cellphone", None)
+        without_phone.add(json.dumps(user, sort_keys=True))
+    assert len(without_phone) > 1
 
 
 def test_every_built_in_payload_is_one_the_endpoint_accepts():
@@ -135,30 +168,62 @@ def test_every_built_in_payload_is_one_the_endpoint_accepts():
 
     Validated through the request model itself rather than by re-checking the date
     arithmetic here, so any rule the endpoint adds later is enforced on this workload too.
+    All 200 are checked, not a prefix: 200 is `--payload-count`'s default and what the
+    sweep actually sends, so checking 100 left the second half of the real workload unseen.
     """
     from bl_ranking.serving.schemas import RankRequest
 
-    for payload in load_payloads(None, count=100):
+    for payload in load_payloads(None, count=200):
         RankRequest(**json.loads(payload))
 
 
 def test_a_run_that_mostly_errors_is_not_reported_as_latency():
     """The row said "ok" while half the traffic was a 422. Percentiles of refusals look
-    excellent, so the verdict column has to say what happened instead."""
-    def summary(ok, errors):
-        return {"target_rps": 100, "achieved_rps": 50.0, "ok": ok, "errors": errors,
-                "service_ms": {"p50": 1.0, "p99": 2.0, "max": 3.0},
-                "send_lag_ms": {"p50": 0.1, "p99": 0.2},
-                "client_ms": {"p50": 1.1, "p99": 2.2},
-                "server_ms": {"p50": 0.9, "p99": 1.8},
-                "generator_saturated": False, "saturation_reasons": [],
-                "offered": ok + errors, "max_in_flight": 4, "processes": 3}
+    excellent, so the verdict has to say what happened instead - and it is checked as the
+    verdict `summary()` computed, not as a substring that also occurs in the table header.
 
-    mostly_errors = render([summary(ok=500, errors=500)])
-    assert "50% NOT 2xx" in mostly_errors
-    assert "not a latency measurement" in mostly_errors
+    Built through Result so the verdict comes from the code under test rather than a hand
+    dict: a hand dict can carry any verdict, which is how the old "  ok" check passed
+    against the header even when no row was actually marked ok.
+    """
+    def summary(ok, errors, status=503):
+        result = Result(target_rps=100, duration_s=10, offered=ok + errors)
+        result.span_s = 10.0
+        result.samples = [_sample(due=0.0, sent=0.0, finished=0.01) for _ in range(ok)]
+        result.samples += [
+            _sample(due=0.0, sent=0.0, finished=0.01, status=status, server_ms=None)
+            for _ in range(errors)
+        ]
+        return result.summary()
+
+    mostly_errors = summary(ok=500, errors=500)
+    assert mostly_errors["verdict"] == "50% NOT 2xx"
+    text = render([mostly_errors])
+    assert "50% NOT 2xx" in text
+    assert "not a latency measurement" in text
 
     # One reset in a thousand is not a story, and must not bury the real verdict.
-    healthy = render([summary(ok=1000, errors=1)])
-    assert "NOT 2xx" not in healthy
-    assert "  ok" in healthy
+    healthy = summary(ok=1000, errors=1)
+    assert healthy["verdict"] == "ok"
+    rendered = render([healthy])
+    assert "NOT 2xx" not in rendered
+    data_row = next(ln for ln in rendered.splitlines() if ln.strip().startswith("100"))
+    assert data_row.rstrip().endswith("ok")
+
+
+def test_a_run_with_no_responses_at_all_is_still_given_a_verdict():
+    """A 100%-error row used to take the "no successful responses" branch and never get an
+    error verdict - the one case the error check missed. A dead port (transport failures,
+    no bodies) must read as "no response", not as the payload advice meant for non-2xx."""
+    dead_port = Result(target_rps=100, duration_s=10, offered=200)
+    dead_port.span_s = 10.0
+    dead_port.errors = 200                    # connection failures: no samples at all
+    summary = dead_port.summary()
+
+    assert summary["verdict"] == "100% no response"
+    assert summary["transport_errors"] == 200
+    text = render([summary])
+    assert "100% no response" in text
+    assert "GET /readyz" in text
+    # The payload advice is for non-2xx bodies, of which there were none here.
+    assert "Fix the payloads" not in text

@@ -46,11 +46,13 @@ Reported numbers
                      which includes any wait inside that worker's own event loop - so the
                      gap between it and `service` is connection and OS queueing, not "all
                      of the queueing".
-  * offered / ok / achieved. achieved is ok over the *offered* window, so it cannot read
-    above target because the drain ran long.
+  * offered / ok / achieved. achieved is ok over the whole measured span, drain
+    included - not over the offered window. A long drain therefore pushes it below
+    target; Poisson variance in the number of arrivals can nudge it a little above.
 
 Percentiles are nearest-rank on the sorted sample (no interpolation), so every reported
-value is a real observation.
+percentile is a real observation. `mean` is the one figure that is computed rather than
+observed, and it is labelled as such.
 """
 
 from __future__ import annotations
@@ -154,13 +156,45 @@ class Result:
         if self.max_in_flight > 4 * self.connections * self.processes:
             reasons.append("queued")
         saturated = bool(reasons)
+
+        # Two kinds of failure, kept apart because they call for different action and used
+        # to be merged into one "errors" count that then drove the wrong explanation.
+        #   http      - a response arrived with a non-2xx status. The payloads are the
+        #               thing to look at (most cheaply a 422), and the percentiles below
+        #               are of the 2xx responses only, so a mostly-refused run still shows
+        #               a clean-looking latency for the handful that succeeded.
+        #   transport - no response at all: a refused connection, a reset, a timeout.
+        #               The server being down or unreachable is the thing to look at, and
+        #               "fix the payloads" is exactly the wrong advice for it.
+        http_errors = sum(1 for s in self.samples if s.status != 200)
+        transport_errors = self.errors
+        errors = http_errors + transport_errors
+        total = len(ok) + errors
+        share = errors / total if total else 0.0
+        # The verdict that will appear in the table's own column, computed once here so the
+        # JSON carries it too and the explanation footers can key off what was printed
+        # rather than re-deriving it and disagreeing (which is how a footer came to explain
+        # a marking on no row, and the 100%-error row got no error verdict at all).
+        if total == 0:
+            verdict = "no traffic"
+        elif share > ERROR_SHARE_LIMIT:
+            kind = "no response" if transport_errors >= http_errors else "NOT 2xx"
+            verdict = f"{share:.0%} {kind}"
+        elif saturated:
+            verdict = "GENERATOR " + "+".join(reasons).upper()
+        else:
+            verdict = "ok"
         return {
             "target_rps": self.target_rps,
             "achieved_rps": achieved,
             "offered": self.offered,
             "requests": len(self.samples),
             "ok": len(ok),
-            "errors": self.errors + sum(1 for s in self.samples if s.status != 200),
+            "errors": errors,
+            "http_errors": http_errors,
+            "transport_errors": transport_errors,
+            "error_share": round(share, 4),
+            "verdict": verdict,
             "max_in_flight": self.max_in_flight,
             "processes": self.processes,
             # True means the row describes this program rather than the service. Reported
@@ -183,7 +217,13 @@ class Result:
 
 
 def _percentiles(values: list[float]) -> dict[str, float]:
-    """Nearest-rank percentiles: every number returned is an observed value."""
+    """Nearest-rank percentiles: every percentile returned is an observed value.
+
+    `mean` is the exception - it is the arithmetic mean of the sample, so it is computed
+    rather than observed. It is included because it separates a tail-heavy distribution
+    from a uniformly slow one, but it is not one of the observations and the docstrings
+    that describe this output say so.
+    """
     if not values:
         return {}
     def at(q: float) -> float:
@@ -353,6 +393,16 @@ def load_payloads(path: Path | None, count: int) -> list[bytes]:
             raise SystemExit(f"--payloads {path} contains no records.")
         return [json.dumps(r).encode() for r in records]
 
+    # Refused here by name, exactly like the empty `--payloads` file above. An empty
+    # payload list otherwise reached `_drive`, where `payloads[len(tasks) % len(payloads)]`
+    # is a modulo by zero - a ZeroDivisionError raised mid-run, several arrivals in, rather
+    # than a clean message before the run starts.
+    if count < 1:
+        raise SystemExit(
+            f"--payload-count must be at least 1 (got {count}); it is the number of "
+            f"distinct synthetic users to generate."
+        )
+
     rng = random.Random(7)
     cities = ["Fort Lauderdale", "Austin", "Chicago", "Phoenix", "Seattle", "Miami"]
     names = ["Rigoberto", "Michael", "Jennifer", "Svetlana", "Ahmed", "Priya", "Marcus"]
@@ -383,31 +433,32 @@ def load_payloads(path: Path | None, count: int) -> list[bytes]:
 
 
 def render(summaries: list[dict]) -> str:
-    """The report. Service latency is the headline; send lag says whether to believe it."""
-    lines = [
-        "",
+    """The report. Service latency is the headline; send lag says whether to believe it.
+
+    The verdict in the last column is the one computed in `summary()`, not re-derived
+    here, so the explanation blocks below can be printed for exactly the verdicts that
+    appeared and nothing else. A row with no successful responses still gets its verdict
+    (a 100%-error run is the case the old code passed straight through as "no successful
+    responses" and never marked), with dashes where a latency it does not have would go.
+    """
+    header = (
         f"{'target':>7} {'achv':>7} {'ok':>7} {'err':>4} "
         f"{'svc p50':>8} {'svc p99':>8} {'svc max':>9} "
-        f"{'lag p50':>8} {'lag p99':>9} {'clnt p50':>9} {'clnt p99':>10}  verdict",
-        "-" * 116,
-    ]
+        f"{'lag p50':>8} {'lag p99':>9} {'clnt p50':>9} {'clnt p99':>10}  verdict"
+    )
+    lines = ["", header, "-" * len(header)]
     for s in summaries:
         service, lag, client = s["service_ms"], s["send_lag_ms"], s["client_ms"]
+        verdict = s["verdict"]
         if not service:
-            lines.append(f"{s['target_rps']:>7.0f} {'-':>7} {s['ok']:>7} {s['errors']:>4}"
-                         f"   no successful responses")
+            # No 2xx responses, so there are no latency percentiles to print - but the
+            # verdict (which says why, e.g. "100% NOT 2xx" or "100% no response") still is.
+            dash = f"{'-':>8} {'-':>8} {'-':>9} {'-':>8} {'-':>9} {'-':>9} {'-':>10}"
+            lines.append(
+                f"{s['target_rps']:>7.0f} {'-':>7} {s['ok']:>7} {s['errors']:>4} "
+                f"{dash}  {verdict}"
+            )
             continue
-        # An error rate worth noticing outranks everything else in this column. A run whose
-        # payloads the endpoint refuses still produces clean-looking percentiles - of the
-        # refusals - and the row said "ok" while half the traffic was a 422, which is how a
-        # service answering nothing useful got reported as its own capacity.
-        share = s["errors"] / max(1, s["ok"] + s["errors"])
-        if share > ERROR_SHARE_LIMIT:
-            verdict = f"{share:.0%} NOT 2xx"
-        elif s["generator_saturated"]:
-            verdict = "GENERATOR " + "+".join(s["saturation_reasons"]).upper()
-        else:
-            verdict = "ok"
         lines.append(
             f"{s['target_rps']:>7.0f} {s['achieved_rps']:>7.1f} {s['ok']:>7} "
             f"{s['errors']:>4} {service['p50']:>8.2f} {service['p99']:>8.2f} "
@@ -428,16 +479,26 @@ def render(summaries: list[dict]) -> str:
                 f"handler header p50 {s['server_ms']['p50']:.2f} p99 "
                 f"{s['server_ms']['p99']:.2f}"
             )
-    if any(s["errors"] / max(1, s["ok"] + s["errors"]) > ERROR_SHARE_LIMIT
-           for s in summaries):
+    # Each footer is emitted only when a row actually carries the verdict it explains, so a
+    # block never describes a marking that is on no row.
+    if any("NOT 2xx" in s["verdict"] for s in summaries):
         lines += [
             "",
-            "A row marked ... NOT 2xx is not a latency measurement. The percentiles on it",
-            "are the percentiles of whatever the endpoint returned instead - most cheaply, a",
-            "422 - so the service looks fast and idle while it serves nobody. Fix the",
-            "payloads (POST one by hand and read the body) before reading anything else.",
+            "A row marked ... NOT 2xx is not a latency measurement. Its percentiles are of",
+            "the 2xx responses only - often a small, unrepresentative handful - while most of",
+            "the traffic was refused (most cheaply, a 422), so the service looks fast and idle",
+            "while it serves almost nobody. Fix the payloads (POST one by hand and read the",
+            "body) before reading anything else.",
         ]
-    if any(s["generator_saturated"] for s in summaries):
+    if any("no response" in s["verdict"] for s in summaries):
+        lines += [
+            "",
+            "A row marked ... no response got no reply at all for that share of requests -",
+            "a refused connection, a reset, or a timeout, not a non-2xx body. Check that the",
+            "endpoint is up and reachable (GET /readyz) before reading the latencies; this is",
+            "not a payload problem.",
+        ]
+    if any(s["verdict"].startswith("GENERATOR") for s in summaries):
         lines += [
             "",
             "A row marked GENERATOR ... describes this program, not the service.",
