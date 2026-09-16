@@ -448,17 +448,20 @@ def test_the_two_brand_counts_have_two_names(client, example_user):
     assert info["n_brands"] >= meta["brands_ranked"]
 
 
-def test_a_worker_with_no_model_is_visible_on_the_dashboard(client, monkeypatch):
+def test_a_worker_with_no_model_is_visible_on_the_dashboard(client, example_user, monkeypatch):
     """A worker whose model failed to load answers every request 503 while emitting no
-    request metrics at all, so it looked exactly like a worker nobody was calling."""
+    request metrics at all, so it looked exactly like a worker nobody was calling.
+
+    A well-formed request, because validation runs first and an empty body is a 422
+    before readiness is ever consulted - which is also why /model, which this test used
+    to count on, no longer counts: it is a probe, not a ranking request."""
     from bl_ranking.serving import app as app_module
 
     before = app_module.REQUESTS.labels("not_ready")._value.get()
     monkeypatch.setattr(app_module.state, "ranker", None)
-    assert client.post("/rank", json={}).status_code in (422, 503)
-    monkeypatch.setattr(app_module.state, "ranker", None)
+    assert client.post("/rank", json=example_user).status_code == 503
     assert client.get("/model").status_code == 503
-    assert app_module.REQUESTS.labels("not_ready")._value.get() > before
+    assert app_module.REQUESTS.labels("not_ready")._value.get() == before + 1
 
 
 @pytest.mark.parametrize("keyword", ["now", "today"])
@@ -640,3 +643,155 @@ def test_a_long_message_is_clipped_even_if_a_validator_forgets():
     clipped = _clipped("x" * 5000)
     assert len(clipped) < MAX_MESSAGE_CHARS + 60
     assert "5000 characters" in clipped
+
+
+# --- Per-field cost ---------------------------------------------------------------------
+#
+# The body limit bounds the bytes, not the work they buy. A 64 KB body whose session_dt
+# was 64 KB of spaces in front of a valid date passed the limit, parsed cleanly in
+# pd.to_datetime at ~17 us per byte, returned 200, and held the event loop for ~1 s; four
+# such connections stopped a single worker answering /healthz. Every string field is now
+# capped before any validator touches it, and the timestamps more tightly still.
+
+@pytest.mark.parametrize("field", ["session_dt", "register_date", "conversion_dt"])
+def test_a_padded_timestamp_is_refused_before_it_is_parsed(client, example_user, field):
+    from bl_ranking.serving.schemas import MAX_TIMESTAMP_CHARS
+
+    padded = " " * 2000 + "2026-01-06 19:26:07"
+    response = client.post("/rank", json={**example_user, field: padded})
+    assert response.status_code == 422
+    message = str(response.json()["detail"])
+    assert "characters long" in message
+    # And a timestamp that is merely generous - an offset, fractional seconds - still fits.
+    assert len("2026-01-06T19:26:07.123456+05:30") < MAX_TIMESTAMP_CHARS
+    fine = client.post("/rank", json={**example_user, field: "2026-01-06 19:26:07"})
+    assert fine.status_code == 200
+
+
+def test_a_string_field_over_the_cap_is_refused_whatever_it_holds(client, example_user):
+    from bl_ranking.serving.schemas import MAX_TEXT_CHARS
+
+    response = client.post("/rank", json={**example_user, "page": "x" * (MAX_TEXT_CHARS + 1)})
+    assert response.status_code == 422
+    assert "characters long" in str(response.json()["detail"])
+    assert client.post("/rank", json={**example_user, "page": "x" * MAX_TEXT_CHARS}).status_code == 200
+
+
+def test_the_cap_costs_nothing_measurable_and_the_parse_is_never_reached(example_user):
+    """Validated in-process so the timing is the validator's alone: the whole point is
+    that refusing 64 KB of padding must not cost 64 KB of parsing."""
+    import time
+
+    from bl_ranking.serving.schemas import RankRequest
+
+    RankRequest(**example_user)                                  # warm
+    padded = {**example_user, "session_dt": " " * 60_000 + "2020-01-01"}
+    started = time.perf_counter()
+    with pytest.raises(ValueError):
+        RankRequest(**padded)
+    assert time.perf_counter() - started < 0.05                 # was ~0.8 s
+
+
+def test_a_body_the_parser_cannot_read_is_counted(client):
+    """FastAPI answers these 400 itself, before any code here runs, and the latency
+    histogram timed them while no outcome counted them - so the two metrics disagreed by
+    exactly the number of such bodies and the traffic was invisible."""
+    from bl_ranking.serving import app as app_module
+
+    before = app_module.REQUESTS.labels("bad_body")._value.get()
+    nested = ("[" * 30_000 + "]" * 30_000).encode()
+    response = client.post("/rank", content=nested, headers={"content-type": "application/json"})
+    assert response.status_code == 400
+    assert app_module.REQUESTS.labels("bad_body")._value.get() == before + 1
+
+
+@pytest.mark.parametrize(("header", "expected"), [
+    (b"1024", 1024),
+    (b"  1024  ", 1024),
+    (b"-1", None),           # int() read this as "under the limit" and skipped the cap
+    (b"1_0", None),          # int() accepts underscores; the wire format does not
+    (b"+5", None),
+    (b"abc", None),
+])
+def test_a_content_length_is_digits_or_it_is_not_a_length(header, expected):
+    from bl_ranking.serving.app import _declared_length
+
+    assert _declared_length({"headers": [(b"content-length", header)]}) == expected
+
+
+def test_a_probe_of_model_is_not_a_refused_ranking_request(client, example_user, monkeypatch):
+    """Five GET /model polls on a not-ready worker read as five refused users."""
+    from bl_ranking.serving import app as app_module
+
+    saved = app_module.state.ranker
+    try:
+        before = app_module.REQUESTS.labels("not_ready")._value.get()
+        monkeypatch.setattr(app_module.state, "ranker", None)
+        for _ in range(3):
+            assert client.get("/model").status_code == 503
+        assert app_module.REQUESTS.labels("not_ready")._value.get() == before
+        assert client.post("/rank", json=example_user).status_code == 503
+        assert app_module.REQUESTS.labels("not_ready")._value.get() == before + 1
+    finally:
+        app_module.state.ranker = saved
+
+
+def test_the_published_schema_names_the_field_the_response_carries(client, example_user):
+    """RankMeta is only read by OpenAPI - the handler is response_model=None - and it kept
+    `n_brands` after the handler moved to `brands_ranked`, so a client generated from
+    /openapi.json required a field no response ever carried."""
+    meta = client.post("/rank", json=example_user).json()["meta"]
+    schema = client.get("/openapi.json").json()["components"]["schemas"]["RankMeta"]
+    assert set(schema["required"]) <= set(meta)
+    assert "brands_ranked" in schema["properties"]
+    assert "n_brands" not in schema["properties"]
+
+
+# --- The metrics directory is shared state, and shared state gets junk in it ------------
+
+def test_a_stray_entry_in_the_metrics_directory_does_not_break_the_scrape(client, monkeypatch,
+                                                                          other_worker):
+    """A directory named like a gauge file, a 0-byte file (which a starting worker has for
+    a moment), and a file of junk each turned every scrape into a 500 until removed."""
+    from bl_ranking.serving import app as app_module
+
+    (other_worker / "gauge_livemin_x.db").mkdir()
+    (other_worker / "counter_999999.db").write_bytes(b"")
+    (other_worker / "histogram_abc.db").write_bytes(b"junk")
+    (other_worker / "not_a_metric.txt").write_text("hello")
+    monkeypatch.setattr(app_module, "MULTIPROC_DIR", str(other_worker))
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert 'bl_rank_requests_total{outcome="ok"} 7.0' in response.text
+
+
+def test_losing_the_race_to_delete_a_dead_workers_file_is_not_an_error(tmp_path, monkeypatch):
+    """Two scrapes sweeping at once both find the same dead worker; only one can delete."""
+    from prometheus_client import multiprocess
+
+    from bl_ranking.serving import app as app_module
+
+    (tmp_path / "gauge_livemin_300001.db").write_bytes(b"\x08\x00\x00\x00" + b"\x00" * 60)
+    calls = []
+
+    def racing(pid, path=None):
+        calls.append(pid)
+        raise FileNotFoundError("the other scrape got there first")
+
+    monkeypatch.setattr(multiprocess, "mark_process_dead", racing)
+    app_module._forget_dead_workers(str(tmp_path))       # must not raise
+    assert calls == [300001]
+
+
+def test_the_plain_registry_exposition_carries_the_values_not_only_the_names(client, example_user):
+    """`# HELP` lines exist for untouched metrics, so asserting names proved nothing."""
+    from bl_ranking.serving import app as app_module
+
+    before = app_module.REQUESTS.labels("ok")._value.get()
+    client.post("/rank", json=example_user)
+    body = client.get("/metrics").text
+    assert f'bl_rank_requests_total{{outcome="ok"}} {before + 1}' in body
+    assert "bl_rank_latency_seconds_count" in body
+    latency_count = float(next(line.split()[-1] for line in body.splitlines()
+                               if line.startswith("bl_rank_latency_seconds_count")))
+    assert latency_count >= before + 1

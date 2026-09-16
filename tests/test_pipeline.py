@@ -1903,7 +1903,27 @@ def test_the_weekly_job_runs_the_three_steps_it_documents():
     assert "return" in source.split("train_test=False", 1)[1].split("train_test=True", 1)[0]
 
 
-def test_the_training_path_finds_a_pre_placed_tabpfn_checkpoint(monkeypatch, tmp_path):
+@pytest.fixture
+def tabpfn_env(monkeypatch, tmp_path):
+    """A clean TabPFN environment that is put back afterwards.
+
+    prepare_tabpfn_environment writes to os.environ directly, which monkeypatch does not
+    track, and delenv of an absent variable records nothing to undo - so the first version
+    of these tests left TABPFN_MODEL_CACHE_DIR pointing at a finished test's tmp_path for
+    the rest of the session.
+    """
+    from bl_ranking.models import payout
+
+    names = ("TABPFN_MODEL_CACHE_DIR", "TABPFN_DISABLE_TELEMETRY", "TABPFN_CLIENT_CI_MODE")
+    for key in names:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(payout, "TABPFN_CACHE_DIR", tmp_path / "weights")
+    yield payout
+    for key in names:
+        os.environ.pop(key, None)
+
+
+def test_the_training_path_finds_a_pre_placed_tabpfn_checkpoint(tabpfn_env, tmp_path):
     """The offline flow the README documents has to work where TabPFN actually runs.
 
     Only scripts/serve.sh set TABPFN_MODEL_CACHE_DIR, and serving never constructs a TabPFN
@@ -1913,29 +1933,97 @@ def test_the_training_path_finds_a_pre_placed_tabpfn_checkpoint(monkeypatch, tmp
     in. The variables have to be set by the code, so make, the scheduler, Docker and
     Databricks all behave the same way.
     """
-    from bl_ranking.models import payout
-
-    for key in ("TABPFN_MODEL_CACHE_DIR", "TABPFN_DISABLE_TELEMETRY", "TABPFN_CLIENT_CI_MODE"):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(payout, "TABPFN_CACHE_DIR", tmp_path)
-
-    # Nothing pre-placed: the library must be left to say "could not download", which is
-    # the truth, rather than be pointed at an empty directory and say "not in cache".
+    payout = tabpfn_env
     payout.prepare_tabpfn_environment()
-    assert "TABPFN_MODEL_CACHE_DIR" not in os.environ
+    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == str(tmp_path / "weights")
+    assert (tmp_path / "weights").is_dir()          # so a first online run lands here
     assert os.environ["TABPFN_DISABLE_TELEMETRY"] == "1"
+    assert os.environ["TABPFN_CLIENT_CI_MODE"] == "true"
 
-    (tmp_path / payout.TABPFN_CHECKPOINT).write_bytes(b"not a real checkpoint")
+
+def test_every_path_that_imports_tabpfn_prepares_the_environment_first(tabpfn_env):
+    """The variable is read once, when the library is imported, so a caller that imports
+    before calling prepare_tabpfn_environment gets the library's defaults for the life of
+    the process. The serving restore path did exactly that and went to huggingface.co with
+    the checkpoint sitting in .tabpfn_models. Checked on the source, because a test that
+    only calls the helper cannot tell whether anybody else does."""
+    import inspect
+
+    payout = tabpfn_env
+    for owner in (payout.TabPFNLocalBackend._build, payout.TabPFNLocalBackend.prepare,
+                  payout.TabPFNClientBackend._authenticate):
+        source = inspect.getsource(owner)
+        body = source.replace(owner.__doc__ or "", "")
+        assert "prepare_tabpfn_environment()" in body, owner.__qualname__
+        imports = [line for line in body.splitlines() if "from tabpfn" in line]
+        assert imports, owner.__qualname__
+        assert body.index("prepare_tabpfn_environment()") < body.index(imports[0]), (
+            f"{owner.__qualname__} imports the library before preparing its environment")
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_tabpfn_cache_variable_means_unset(tabpfn_env, tmp_path, value):
+    """`.env` files and compose interpolation produce empty variables routinely, and the
+    rest of the repository treats empty as unset. setdefault did not, and pointed the
+    library at the current working directory."""
+    payout = tabpfn_env
+    os.environ["TABPFN_MODEL_CACHE_DIR"] = value
     payout.prepare_tabpfn_environment()
-    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == str(tmp_path)
+    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == str(tmp_path / "weights")
 
 
-def test_an_operators_own_tabpfn_cache_is_not_overridden(monkeypatch, tmp_path):
+def test_an_operators_own_tabpfn_cache_is_not_overridden(tabpfn_env, tmp_path):
     """Somebody who has set the variable has a reason; a default must not replace it."""
-    from bl_ranking.models import payout
-
-    monkeypatch.setattr(payout, "TABPFN_CACHE_DIR", tmp_path)
-    (tmp_path / payout.TABPFN_CHECKPOINT).write_bytes(b"not a real checkpoint")
-    monkeypatch.setenv("TABPFN_MODEL_CACHE_DIR", "/somewhere/else")
+    payout = tabpfn_env
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.environ["TABPFN_MODEL_CACHE_DIR"] = str(elsewhere)
     payout.prepare_tabpfn_environment()
-    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == "/somewhere/else"
+    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == str(elsewhere)
+
+
+def test_a_tabpfn_cache_path_that_is_a_file_is_named_in_the_error(tabpfn_env, tmp_path):
+    """The library's own failure is a bare FileExistsError naming neither TabPFN nor the
+    variable."""
+    payout = tabpfn_env
+    afile = tmp_path / "afile"
+    afile.write_text("x")
+    os.environ["TABPFN_MODEL_CACHE_DIR"] = str(afile)
+    with pytest.raises(ValueError, match="TABPFN_MODEL_CACHE_DIR"):
+        payout.prepare_tabpfn_environment()
+
+
+def test_a_saved_tabpfn_fit_that_cannot_predict_is_refitted_not_served(tabpfn_env, tmp_path,
+                                                                        monkeypatch, caplog):
+    """A `fit_with_cache` fit restored by load_fitted_tabpfn_model raises on its first
+    predict (the encoders' fitted buffers are not saved), and it did so after prepare()
+    returned - past the catboost_fallback net - so the worker failed warm-up and served 503
+    forever. Verified with a real fit in this session: the restore fails, and a refit from
+    the bundled context is bit-identical to the original. Simulated here so the suite does
+    not need torch."""
+    import types
+
+    import numpy as np
+    import pandas as pd
+
+    payout = tabpfn_env
+    cfg = __import__("bl_ranking.config", fromlist=["PayoutSettings"]).PayoutSettings(
+        backend="tabpfn_local", fit_mode="fit_with_cache")
+    backend = payout.TabPFNLocalBackend(cfg)
+    (tmp_path / backend.FIT_FILE).write_bytes(b"not read: the loader is stubbed")
+    __import__("joblib").dump(payout.CategoricalAdapter(), tmp_path / backend.ADAPTER_FILE)
+
+    broken = types.SimpleNamespace(predict=lambda x: (_ for _ in ()).throw(
+        RuntimeError("The expanded size of the tensor (1) must match the existing size (0)")))
+    fake_tabpfn = types.ModuleType("tabpfn")
+    fake_tabpfn.load_fitted_tabpfn_model = lambda path: broken
+    monkeypatch.setitem(__import__("sys").modules, "tabpfn", fake_tabpfn)
+    refits = []
+    monkeypatch.setattr(backend, "fit", lambda x, y: refits.append(len(x)) or backend)
+
+    x = pd.DataFrame({"a": np.arange(5.0), "b": np.arange(5.0)})
+    context = payout.PayoutContext(x=x, y=pd.Series(np.arange(5.0)), columns=list(x.columns))
+    with caplog.at_level("WARNING"):
+        backend.prepare(context, tmp_path)
+    assert refits == [5], "the fit that cannot predict must be replaced by a refit"
+    assert "cannot predict" in caplog.text

@@ -29,12 +29,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse, PlainTextResponse
 from prometheus_client import (
@@ -46,6 +48,7 @@ from prometheus_client import (
     generate_latest,
     multiprocess,
 )
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from bl_ranking.config import Settings
 from bl_ranking.serving import model_source
@@ -192,6 +195,27 @@ app = FastAPI(
     default_response_class=ORJSONResponse,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def counted_http_error(request, exc: StarletteHTTPException) -> Response:
+    """Count the one failure FastAPI raises before the request reaches any code here.
+
+    A body the JSON parser cannot read - nested past the recursion limit, not valid UTF-8,
+    a client that disconnected mid-body - becomes HTTPException(400, "There was an error
+    parsing the body") inside FastAPI's own request handling. It was timed by the latency
+    histogram and counted by no outcome, so bl_rank_requests_total summed to less than
+    bl_rank_latency_seconds_count by exactly the number of such bodies, and a caller
+    sending a steady stream of them was invisible on the request-rate panel. Counted as
+    `bad_body` and then rendered exactly as before: the handler itself is FastAPI's.
+
+    Registered on Starlette's HTTPException, the base class, because that is the one
+    FastAPI's body parsing raises; a handler on FastAPI's subclass is never consulted for
+    it, and this endpoint's own HTTPExceptions are subclass instances, so both arrive.
+    """
+    if exc.status_code == 400 and request.url.path.startswith("/rank"):
+        REQUESTS.labels("bad_body").inc()
+    return await http_exception_handler(request, exc)
 
 
 @app.exception_handler(RequestValidationError)
@@ -341,7 +365,10 @@ def readyz() -> dict[str, Any]:
 
 @app.get("/model")
 def model_info() -> dict[str, Any]:
-    ranker = _require_ranker()
+    # Not counted: bl_rank_requests_total is ranking traffic, and a monitoring poll of
+    # /model on a not-ready worker was inflating its `not_ready` outcome at the poll's
+    # own cadence - five probes read as five refused users.
+    ranker = _require_ranker(count=False)
     info = dict(ranker.describe())
     info["bundle"] = str(state.bundle_dir)
     # Which of the three resolution tiers actually answered. A worker that fell back to a
@@ -353,6 +380,19 @@ def model_info() -> dict[str, Any]:
     return info
 
 
+# The only file names prometheus_client writes: `<type>_<pid>.db`, with the gauge type
+# carrying its aggregation mode. The scrape reads nothing else. The directory is shared,
+# persistent, operator-settable state, and a single stray entry - a directory somebody
+# created by hand, a 0-byte file a starting worker has opened but not yet sized - used to
+# turn every scrape into a 500 for as long as it was there.
+_METRIC_FILE = re.compile(
+    r"^(?:counter|histogram|summary|gauge_(?:live)?(?:all|min|max|sum|mostrecent))"
+    r"_(?P<pid>\d+)\.db$"
+)
+# A live gauge file, specifically: the ones the sweep may delete.
+_LIVE_GAUGE_FILE = re.compile(r"^gauge_live(?:all|min|max|sum|mostrecent)_(?P<pid>\d+)\.db$")
+
+
 def _forget_dead_workers(path: str) -> None:
     """Delete the live-gauge files of workers that no longer exist.
 
@@ -362,17 +402,58 @@ def _forget_dead_workers(path: str) -> None:
     worker-exit hook - so it happens on scrape, which is the one moment the answer is
     needed. Counter and histogram files are deliberately left alone: a request a since
     replaced worker served still happened, and the totals have to keep counting it.
+
+    Two scrapes can run at once - an HA Prometheus pair, or Prometheus plus somebody's
+    curl - and /metrics is a sync handler, so they run in two threads. Both see the same
+    dead worker's file, both try to delete it, and the loser used to get a
+    FileNotFoundError that became a 500: one scrape in eight, measured, for as long as a
+    dead worker's files were present. Losing that race is not an error.
     """
     for name in os.listdir(path):
-        if not name.startswith("gauge_live"):
+        match = _LIVE_GAUGE_FILE.match(name)
+        if match is None:
             continue
-        pid = name.rsplit("_", 1)[-1].removesuffix(".db")
+        pid = int(match.group("pid"))
         try:
-            os.kill(int(pid), 0)
-        except (ProcessLookupError, ValueError):
-            multiprocess.mark_process_dead(pid, path)
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            try:
+                multiprocess.mark_process_dead(pid, path)
+            except OSError:
+                continue                  # another scrape got there first
         except PermissionError:
             continue                      # alive, just not ours to signal
+
+
+def _readable_metric_files(path: str) -> list[str]:
+    """The files in the directory that prometheus_client wrote and can read back.
+
+    Each candidate is opened once here before the collector opens it, so a file that is
+    not a metrics file - a name the library never writes, a file it has created but not
+    yet sized, junk left by something else - is skipped rather than allowed to raise
+    inside the scrape. A worker's file skipped for being unsized is one that holds no
+    observations yet, so nothing is lost by leaving it out of this scrape.
+    """
+    from prometheus_client.mmap_dict import MmapedDict
+
+    files = []
+    for name in sorted(os.listdir(path)):
+        if _METRIC_FILE.match(name) is None:
+            continue
+        full = os.path.join(path, name)
+        try:
+            MmapedDict.read_all_values_from_file(full)
+        except Exception:  # noqa: BLE001 - unreadable for any reason means "not this scrape"
+            continue
+        files.append(full)
+    return files
+
+
+class _WorkerFiles(multiprocess.MultiProcessCollector):
+    """The library's collector, reading only the files _readable_metric_files vouches for."""
+
+    def collect(self):
+        return self.merge(_readable_metric_files(self._path), accumulate=True)
 
 
 @app.get("/metrics")
@@ -383,7 +464,7 @@ def metrics() -> PlainTextResponse:
     _forget_dead_workers(MULTIPROC_DIR)
     # A fresh registry per scrape, because the collector reads the files as they are now.
     registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(registry, path=MULTIPROC_DIR)
+    _WorkerFiles(registry, path=MULTIPROC_DIR)
     return PlainTextResponse(generate_latest(registry).decode(),
                              media_type=CONTENT_TYPE_LATEST)
 
@@ -490,13 +571,18 @@ class BodyLimit:
 
 
 def _declared_length(scope) -> int | None:
-    """The Content-Length header as an int, or None if absent or unreadable."""
+    """The Content-Length header as a non-negative int, or None if absent or unreadable.
+
+    Digits only, not int(): int() accepts '-1' and '1_0', and a negative length read as
+    "under the limit" and let the body through uncapped. uvicorn's parser refuses those on
+    the wire, so nothing reaches here today - but a guard that can be switched off by the
+    value it was handed is one server swap away from no guard. Anything unreadable takes
+    the counted-read branch, which is the safe direction.
+    """
     for name, value in scope.get("headers", ()):
         if name == b"content-length":
-            try:
-                return int(value)
-            except ValueError:
-                return None
+            text = value.strip()
+            return int(text) if text.isdigit() else None
     return None
 
 
@@ -518,12 +604,13 @@ app.add_middleware(BodyLimit, limit=state.settings.serving.max_body_bytes)
 app.add_middleware(TimingMiddleware)
 
 
-def _require_ranker() -> BrandRanker:
+def _require_ranker(count: bool = True) -> BrandRanker:
     if state.ranker is None:
         # Counted, because this is the total-outage case: a worker whose model failed to
         # load answers every request 503 while emitting no request metrics at all, so on
         # the dashboard it is indistinguishable from a worker nobody is calling.
-        REQUESTS.labels("not_ready").inc()
+        if count:
+            REQUESTS.labels("not_ready").inc()
         raise HTTPException(status_code=503, detail=state.error or "model is still loading")
     return state.ranker
 

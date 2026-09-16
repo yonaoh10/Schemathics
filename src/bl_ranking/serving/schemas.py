@@ -29,6 +29,19 @@ _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 # How much of a rejected value an error message may quote.
 _SHOWN_CHARS = 80
 
+# The longest string any field may carry, and the tighter bound for the three timestamps.
+#
+# The request body is capped at serving.max_body_bytes (64 KB), and that bounds the bytes
+# but not the work they buy: pd.to_datetime costs about 17 us per byte on a whitespace-
+# padded string, so a body sized exactly to the limit with 64 KB of spaces in front of a
+# valid date parsed cleanly, returned 200, and held the event loop for ~1 s - four such
+# connections stopped a worker answering /healthz. Pydantic runs before the handler, on
+# the loop, so the only place to stop it is before the parse. The longest legitimate value
+# here is a page path; a timestamp is 19 characters, or 32 with an offset and fractional
+# seconds. Both caps are several times that and cost one len() per field.
+MAX_TEXT_CHARS = 256
+MAX_TIMESTAMP_CHARS = 64
+
 
 def _shown(value: Any) -> str:
     """A value, rendered short enough to put in an error message.
@@ -165,6 +178,13 @@ class RankRequest(BaseModel):
             value = data.get(key)
             if not isinstance(value, str):
                 continue
+            # Length first: it is the cheap check, and it is what keeps every later
+            # validator's cost bounded. See MAX_TEXT_CHARS.
+            if len(value) > MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"{key} is {len(value):,} characters long; no field here is "
+                    f"more than {MAX_TEXT_CHARS}"
+                )
             try:
                 value.encode("utf-8")
             except UnicodeEncodeError as exc:
@@ -337,6 +357,14 @@ def _normalise_timestamp(value: Any, required: bool) -> str | None:
             f"'today' are refused for the same reason rather than resolved: pandas would "
             f"read them against this server's clock instead of the funnel's own time."
         )
+    # Before pd.to_datetime, which is the expensive call: its cost is linear in the length
+    # of the string, whitespace included, and the model-level cap of MAX_TEXT_CHARS is
+    # still four times what a timestamp can legitimately need.
+    if isinstance(value, str) and len(value) > MAX_TIMESTAMP_CHARS:
+        raise ValueError(
+            f"{_shown(value)} is {len(value)} characters long; a timestamp is at most "
+            f"{MAX_TIMESTAMP_CHARS}"
+        )
     if isinstance(value, datetime):
         parsed = value
     else:
@@ -371,7 +399,11 @@ class RankMeta(BaseModel):
     model_version: str
     payout_backend: str
     payout_exact: bool
-    n_brands: int
+    # `brands_ranked`, matching the response. The handler renamed it - a brand universe of
+    # 15 can rank 14 when one is the sentinel - and this model, which only OpenAPI reads
+    # because the handler is `response_model=None`, kept the old name: the published
+    # contract required a field no response carried.
+    brands_ranked: int
     latency_ms: float
 
 

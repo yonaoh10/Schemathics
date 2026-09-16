@@ -62,7 +62,11 @@ RUN chmod +x scripts/*.sh
 # TABPFN_DISABLE_TELEMETRY: the library reports usage to a third party by default.
 # TABPFN_CLIENT_CI_MODE: the hosted client otherwise wraps every call in a thread and
 #   busy-polls every 200 ms while drawing a spinner, quantising latency onto that grid.
-# TABPFN_MODEL_CACHE_DIR: where baked-in weights live, so a container needs no network.
+# TABPFN_MODEL_CACHE_DIR is deliberately NOT set here. An earlier image named /opt/tabpfn
+#   as "where baked-in weights live" and never put anything there, and because the code
+#   honours an operator's value, that setting stopped it from finding the checkpoint an
+#   operator had placed in .tabpfn_models exactly as the README says - bind-mounted into
+#   this container at /app/.tabpfn_models, which is where the code now looks by default.
 #
 # PYTHON: scripts/serve.sh defaults to the repo's .venv, which is how a developer runs
 #   it. This image installs into the system interpreter and has no .venv, so name it
@@ -73,8 +77,7 @@ ENV OMP_NUM_THREADS=1 \
     PYTHON=python \
     BL_SERVING__PORT=8080 \
     TABPFN_DISABLE_TELEMETRY=1 \
-    TABPFN_CLIENT_CI_MODE=true \
-    TABPFN_MODEL_CACHE_DIR=/opt/tabpfn
+    TABPFN_CLIENT_CI_MODE=true
 
 EXPOSE 8080
 

@@ -41,6 +41,7 @@ approximate endpoint is never a silent one.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -53,6 +54,8 @@ import pandas as pd
 
 from bl_ranking.config import REPO_ROOT, PayoutSettings
 
+log = logging.getLogger("bl_ranking.models")
+
 # Where a pre-placed TabPFN checkpoint lives, and the name the library looks for. Training
 # is the only process that runs TabPFN - serving scores the distilled surrogate - so this
 # is where the offline story has to hold.
@@ -61,26 +64,43 @@ TABPFN_CHECKPOINT = "tabpfn-v2-regressor.ckpt"
 
 
 def prepare_tabpfn_environment() -> None:
-    """Point TabPFN at a local checkpoint and stop it phoning home.
+    """Point TabPFN at the repository's checkpoint directory and stop it phoning home.
 
     scripts/serve.sh set these three variables and the training path set none of them,
-    which is exactly backwards: the surrogate's teacher runs in the weekly job, and serving
-    never constructs a TabPFN at all. So `make train-prod BACKEND=tabpfn_local` on a box
-    with the checkpoint already in `.tabpfn_models` - the layout the README tells you to
-    create for an offline run - still tried to fetch it from huggingface.co and failed with
-    a proxy error naming a URL, two minutes into the job.
+    which is exactly backwards: the surrogate's teacher runs in the weekly job, and the
+    shipped serving path never constructs a TabPFN at all. So `make train-prod
+    BACKEND=tabpfn_local` on a box with the checkpoint already in `.tabpfn_models` - the
+    layout the README tells you to create for an offline run - still tried to fetch it
+    from huggingface.co and failed with a proxy error naming a URL, two minutes in.
 
-    `setdefault`, so an operator who has set any of these keeps their value. The cache
-    directory is only defaulted when the checkpoint is actually there: pointing the library
-    at an empty directory would replace a clear "could not download" with a confusing
-    "not found in cache".
+    Called by every path that imports the library, and it has to run *before* the import:
+    the library reads the variable once, at load, so a later call cannot repair it.
+
+    An operator's own value wins, and an empty one counts as unset - the convention the
+    rest of this repository uses for BL_* variables and what `${VAR:-default}` does in the
+    shell, whereas `setdefault` kept an empty string and pointed the library at the
+    current working directory. The default is set whether or not the checkpoint is there
+    yet: with it absent the library downloads into the directory named, so the first
+    online run lands the weights where the documentation says they live rather than in
+    $HOME/.cache, and every later run is offline.
     """
-    if (TABPFN_CACHE_DIR / TABPFN_CHECKPOINT).exists():
-        os.environ.setdefault("TABPFN_MODEL_CACHE_DIR", str(TABPFN_CACHE_DIR))
+    chosen = os.environ.get("TABPFN_MODEL_CACHE_DIR", "").strip()
+    if not chosen:
+        TABPFN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        os.environ["TABPFN_MODEL_CACHE_DIR"] = str(TABPFN_CACHE_DIR)
+    elif Path(chosen).exists() and not Path(chosen).is_dir():
+        # The library fails on this with a bare FileExistsError that names neither
+        # TabPFN nor the variable.
+        raise ValueError(
+            f"TABPFN_MODEL_CACHE_DIR={chosen!r} is a file, not a directory. It names where "
+            f"TabPFN keeps its checkpoint ({TABPFN_CHECKPOINT}); unset it to use "
+            f"{TABPFN_CACHE_DIR}."
+        )
     # Telemetry on a training box is a proxy error per fit at best; the hosted client's
-    # progress spinner busy-polls on a 200 ms grid.
-    os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
-    os.environ.setdefault("TABPFN_CLIENT_CI_MODE", "true")
+    # progress spinner busy-polls on a 200 ms grid. Empty means unset here too.
+    for name, value in (("TABPFN_DISABLE_TELEMETRY", "1"), ("TABPFN_CLIENT_CI_MODE", "true")):
+        if not os.environ.get(name, "").strip():
+            os.environ[name] = value
 
 # Columns the research code hands the payout model are a mix of numeric and free text.
 # CatBoost takes them natively; TabPFN needs them ordinal-encoded, which the
@@ -334,15 +354,45 @@ class TabPFNLocalBackend(PayoutBackend):
         return [self.FIT_FILE, self.ADAPTER_FILE]
 
     def prepare(self, context: PayoutContext, directory: Path) -> PayoutBackend:
-        """Restore the saved fit if the bundle has one; otherwise refit the context."""
+        """Restore the saved fit if the bundle has one and it works; otherwise refit.
+
+        Two things this used to get wrong, both on the path every serving process takes.
+
+        The environment was not prepared before the import, so the restore resolved the
+        foundation weights through the library's defaults - $HOME/.cache and then
+        huggingface.co - ignoring a checkpoint sitting in `.tabpfn_models` exactly as
+        documented, and after ~30 s of retries the worker came up on the CatBoost fallback
+        with a different ranking and a log line to say so.
+
+        And a restored `fit_with_cache` fit cannot predict at all: `load_fitted_tabpfn_model`
+        rebuilds the estimator on freshly initialised weights and re-attaches the saved
+        KV cache, but the encoders' fitted buffers are not part of what it saves, so the
+        first predict raises a tensor-size error - after prepare() returned, so the
+        catboost_fallback safety net never saw it, and the worker failed warm-up and
+        answered 503 forever. `fit_preprocessors` round-trips exactly; the shipped default
+        does not. So the restore is verified with one prediction on the context's first
+        row, and a fit that cannot predict is refitted from the context the bundle carries
+        - which is bit-identical to the training-time fit (same rows, same seed) and costs
+        the cache build once at start-up, roughly 15-30 s on CPU. The bundle's saved fit is
+        then merely unused rather than fatal.
+        """
         fit_path = directory / self.FIT_FILE
         adapter_path = directory / self.ADAPTER_FILE
         if fit_path.exists() and adapter_path.exists():
+            prepare_tabpfn_environment()      # before the import: the library reads it at load
             from tabpfn import load_fitted_tabpfn_model
 
             self._adapter = joblib.load(adapter_path)
             self._model = load_fitted_tabpfn_model(str(fit_path))
-            return self
+            try:
+                self.predict(context.x.head(1))
+                return self
+            except Exception as exc:  # noqa: BLE001 - any failure here means "refit"
+                log.warning(
+                    "the saved TabPFN fit in %s loads but cannot predict (%s: %s); refitting "
+                    "from the bundled context instead, which gives the same predictions",
+                    fit_path.name, type(exc).__name__, str(exc)[:120],
+                )
         return self.fit(context.x, context.y)
 
     def describe(self) -> dict[str, Any]:
