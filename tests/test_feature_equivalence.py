@@ -70,7 +70,10 @@ def _random_user(rng: random.Random, base: dict) -> dict:
     user["monthly_revenue"] = rng.choice([b for b, _ in schema.MONTHLY_REVENUE_BANDS])
     user["time_in_business"] = rng.choice(
         [b for b, _ in schema.TIME_IN_BUSINESS_BANDS] + ["unmapped answer", None])
-    user["industry"] = rng.choice(schema.INDUSTRIES + [None, "-", "X"])
+    # 42 is a non-string survey answer: on the serving broadcast the column is
+    # homogeneously numeric, so the research .str accessor raises and the fast path must
+    # too. Only reachable here because these users bypass RankRequest's str|None fence.
+    user["industry"] = rng.choice(schema.INDUSTRIES + [None, "-", "X", 42])
     user["business_type"] = rng.choice(schema.BUSINESS_TYPES + [None])
     user["loan_reason"] = rng.choice(schema.LOAN_REASONS)
     user["device_type"] = rng.choice(schema.DEVICE_TYPES + [None])
@@ -140,6 +143,19 @@ def test_missing_register_date_is_refused_by_both(paths, example_user):
     user["register_date"] = None
     left, right = _rank_or_marker(research, user), _rank_or_marker(fast, user)
     assert left[0] == right[0] == "error"
+
+
+def test_a_numeric_survey_answer_is_refused_by_both(paths, example_user):
+    """One user broadcast to N brands makes a numeric survey column homogeneously numeric,
+    so the research `.str` accessor raises rather than yielding NaN - the fast path used to
+    return 'other' and answer a full ranking instead, diverging. Both refuse now. Reachable
+    only by calling the feature path directly: RankRequest's str|None typing turns this into
+    a 422 on both HTTP and pyfunc, so it is the fence, not the equivalence, that held before.
+    """
+    research, fast = paths
+    user = {**example_user, "industry": 42}
+    left, right = _rank_or_marker(research, user), _rank_or_marker(fast, user)
+    assert left[0] == right[0] == "error", (left, right)
 
 
 def test_the_two_paths_agree_on_a_span_of_years(paths, example_user):

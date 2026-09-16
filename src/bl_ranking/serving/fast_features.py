@@ -2,16 +2,15 @@
 
 Why this exists
 ---------------
-Profiling one request (1 user x 15 brands) through the research pipeline gives 60.3 ms
-p50 against the production model (81k training rows),
-and almost none of it is arithmetic. It is pandas per-operation overhead: a cross join
-(3.0 ms), a DataFrame construction from a dict (0.85 ms), four `to_datetime` calls
-(0.6 ms each), `Series.apply(lambda: pd.Series(...))` for the gender feature (1.3 ms),
-and roughly twenty `.loc[mask, col] = value` assignments across the four band mappings
-(0.33 ms each). That cost is per *operation*, not per row, so it does not shrink with
-the data - it is simply the price of expressing a 15-row transform as ~100 pandas calls.
+Profiling one request (1 user x 10 brands) through the research pipeline gives ~66.8 ms
+p50 against the production model, and almost none of it is arithmetic. It is pandas
+per-operation overhead: a cross join, a DataFrame construction from a dict, four
+`to_datetime` calls, `Series.apply(lambda: pd.Series(...))` for the gender feature, and
+roughly twenty `.loc[mask, col] = value` assignments across the four band mappings. That
+cost is per *operation*, not per row, so it does not shrink with the data - it is simply
+the price of expressing a 10-row transform as ~100 pandas calls.
 
-On a synchronous funnel endpoint, 60 ms of frame bookkeeping is the entire budget.
+On a synchronous funnel endpoint, ~67 ms of frame bookkeeping is the entire budget.
 
 What this module is
 -------------------
@@ -268,11 +267,29 @@ def _is_na(value: Any) -> bool:
 def _lower_or_other(value: Any) -> str:
     """`.str.lower()`, then `.where(len > 1, nan)`, then `.fillna('other')`.
 
-    The `.str` accessor yields NaN for any non-string element, so a numeric survey
-    answer becomes 'other' rather than being stringified - reproduced here.
+    `None` maps to 'other': in the research broadcast the column is object dtype, the
+    `.str` accessor yields NaN for it, and `.fillna('other')` turns that into 'other'.
+
+    A non-string, non-None value (a number, a bool) is REFUSED rather than turned into
+    'other'. This docstring used to claim it became 'other', but the research code does not
+    do that on the serving path: one user is broadcast to N brands, so the survey column is
+    homogeneously numeric, and `.str.lower()` on a numeric column raises
+    `AttributeError: Can only use .str accessor with string values!` - it does not yield
+    NaN. Returning 'other' here let the fast path answer a full ranking where the research
+    path raised, which is exactly the divergence the equivalence contract forbids. Both
+    request surfaces (HTTP and pyfunc) already reject a non-string survey field at the
+    schema, so this is reachable only by calling the feature path directly; refusing makes
+    the two paths identical by construction rather than by that type fence alone.
     """
-    if not isinstance(value, str):
+    if value is None:
         return "other"
+    if not isinstance(value, str):
+        raise TypeError(
+            f"survey answer {value!r} is {type(value).__name__}, not a string; on the "
+            f"research path one user broadcast to N brands is a homogeneously numeric "
+            f"column and .str.lower() raises, so this path refuses it too rather than "
+            f"silently mapping it to 'other'"
+        )
     lowered = value.lower()
     return lowered if len(lowered) > 1 else "other"
 
