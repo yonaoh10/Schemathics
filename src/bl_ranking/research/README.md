@@ -30,6 +30,6 @@ Two things to know if you read them:
 - They only parse on **Python 3.12+**. Lines 263-265 of `bl_models_train.py` use PEP 701
   f-strings (a newline and a nested same-type quote inside the expression), which is a
   `SyntaxError` on 3.11.
-- Importing either one executes `nd = NameDataset()` at module scope: 18.6 s and 2.4 GB
+- Importing either one executes `nd = NameDataset()` at module scope: 9.5 s and 2.1 GB
   resident. That is why the serving path never imports `bl_exp_payout_predictor` unless
   `serving.feature_path = research` is set explicitly. See `models/gender_lut.py`.

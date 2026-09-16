@@ -16,19 +16,19 @@ What stays fixed: the context is still the most recent 1000 rows with payout > 0
 the same order, and the estimator is still a TabPFN regressor. What changes is where it
 runs and how often it is constructed.
 
-Four backends, selected by `model.payout.backend`. Measured on a 4-CPU box, one request
-being one user scored against 15 brands:
+Four backends, selected by `model.payout.backend`. Measured on a 12-CPU box, one request
+being one user scored against 10 brands:
 
   surrogate         -> DEFAULT. A CatBoost student distilled from TabPFN's own
-                    predictions at training time. A whole request costs 4.1 ms
-                    against the teacher's 457 ms - both measured end to end over the
-                    same 200 users - for 1.21% of expected payout given up (see
-                    scripts/compare_backends.py). On CPU it is the only option inside
-                    a page-load budget.
+                    predictions at training time. A whole request costs 2.7 ms
+                    against the teacher's 261 ms - both measured end to end over the
+                    same 200 users - for a mean 0.00% (worst-case 0.41%) of expected
+                    payout given up (see scripts/compare_backends.py). On CPU it is the
+                    only option inside a page-load budget.
   tabpfn_client     The research code's hosted model, with fit() lifted out of the
                     request path: the weekly job fits once and the serving process
                     reuses the server-side fitted set. Exact. One round trip per request.
-  tabpfn_local      TabPFN weights in-process. Exact and private, but 457 ms per
+  tabpfn_local      TabPFN weights in-process. Exact and private, but 261 ms per
                     request on CPU even with fit_with_cache - right for batch scoring,
                     for teaching the surrogate, or on a GPU. Not for the funnel.
   catboost_fallback No TabPFN at all. The degraded path: it keeps the endpoint
@@ -278,23 +278,23 @@ class TabPFNLocalBackend(PayoutBackend):
 
     This is the right backend for batch scoring and for producing the surrogate's
     training labels. It is **not** viable on the synchronous funnel path on CPU:
-    measured on this 4-core box, one request (15 brand rows against a 1000-row
+    measured on this 12-core box, one request (10 brand rows against a 1000-row
     context) costs, holding `n_estimators=2` so only the fit mode varies
 
-        fit_mode="low_memory"        37.3 s     and materially different answers
-        fit_mode="fit_preprocessors"  8.69 s    the library default
-        fit_mode="fit_with_cache"     0.26 s    after a ~14.9 s one-off cache build
+        fit_mode="low_memory"         7.35 s    and materially different answers
+        fit_mode="fit_preprocessors"  7.65 s    the library default
+        fit_mode="fit_with_cache"     0.15 s    after a ~7.95 s one-off cache build
 
-    At the shipped `n_estimators=4` a whole request measures 457 ms p50 over 200 users,
-    against 2.41 ms for the served path. Half a second is still the entire budget of a
-    page load. A GPU changes that; a CPU deployment does not. Saying so plainly is more
+    At the shipped `n_estimators=4` a whole request measures 261 ms p50 over 200 users,
+    against 2.7 ms for the served path. A quarter of a second is still the entire budget of
+    a page load. A GPU changes that; a CPU deployment does not. Saying so plainly is more
     useful than shipping a default that times out.
 
     What `fit_with_cache` does is worth understanding, because it is the reason the
     surrogate is viable at all: TabPFN is in-context learning, so "fitting" is encoding
     the 1000 context rows. Our context is frozen between weekly retrains, so that
     encoding is computed once and the key/value cache kept. `save_fitted_tabpfn_model`
-    serialises that cache, so the ~14.9 s build happens once in the weekly job and every
+    serialises that cache, so the ~7.95 s build happens once in the weekly job and every
     serving replica starts warm with zero network.
     """
 
@@ -686,10 +686,11 @@ class SurrogateBackend(PayoutBackend):
         Read them as a regression detector, not as an estimate of production behaviour.
         The sample is drawn from the payout context - rows a brand actually paid for -
         which is a narrower, higher-value slice than live traffic, and these compare
-        *payout predictions* rather than the ranking those predictions produce. Measured
-        end to end over random users, top-1 agreement is 84.5%, not the ~100% this
-        reports. `scripts/compare_backends.py` is the honest estimate; this is the thing
-        that should scream if a retrain makes the student materially worse.
+        *payout predictions* rather than the ranking those predictions produce. The honest
+        estimate is the end-to-end one over random users - top-1 agreement 99.5% on this
+        extract (`scripts/compare_backends.py`) - which on a different extract can fall well
+        below the ~100% this in-sample check reports; this is the thing that should scream if
+        a retrain makes the student materially worse.
         """
         from scipy.stats import spearmanr
 

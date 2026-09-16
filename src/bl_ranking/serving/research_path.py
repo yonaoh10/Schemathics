@@ -1,7 +1,7 @@
 """The research inference pipeline, wired to warm models.
 
 Kept in its own module because importing it is expensive: bl_exp_payout_predictor.py
-runs `nd = NameDataset()` at module scope, which costs 18 s and 2.4 GB of resident
+runs `nd = NameDataset()` at module scope, which costs 9.5 s and 2.1 GB of resident
 memory. Production serves the fast path (serving/fast_features.py) and never imports
 this, so a serving container starts in ~3.9 s and holds ~290 MB.
 

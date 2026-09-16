@@ -85,7 +85,7 @@ curl -s localhost:8080/rank -H 'content-type: application/json' -d '{
 }
 ```
 
-Truncated to the top three of fifteen. The payouts are this model's, not the contract's:
+Truncated to the top three of ten. The payouts are this model's, not the contract's:
 `meta.model_version` is in every response precisely because the numbers move with the
 version, and re-running the example after a retrain is expected to produce different ones.
 
@@ -143,7 +143,7 @@ because a bundle's sync root is the directory holding it: `conf/config.yaml` and
 A volume rather than a three-part table name, because `data/delta.py` writes with
 delta-rs and delta-rs takes a filesystem path. A name like
 `main.business_loans.bl_sessions` used to be set here and produced a *local directory* of
-that name on the driver's ephemeral disk: the job reported 81,002 rows ingested and the
+that name on the driver's ephemeral disk: the job reported 128,442 rows ingested and the
 real table never changed. That configuration is now refused outright, naming the
 alternative. Reading through Spark instead would mean replacing `read_snapshot` and
 `write_snapshot`, which is the one substitution the module has always documented.
@@ -173,10 +173,10 @@ Both rows of "fitted on" are the same, and that is not a typo. `bl_preprocessing
 `split_by_time(bl_data, days_for_test=7)` unconditionally and fits on the earlier part, so
 the most recent week is held back in production mode too — it is simply never scored
 there. This table said "everything" for a long time, and the bundle manifest reported the
-snapshot size as `rows_train`, which on the real extract overstated it by 23% — 81,002
-against 65,727 actually fitted. The 7-day split accounts for 8,512 of that gap; the rest is
+snapshot size as `rows_train`, which on the real extract overstated it by 57% — 128,442
+against 55,368 actually fitted. The 7-day split accounts for 6,918 of that gap; the rest is
 the research pipeline's own row drops, which happen before it (no register_date, then fewer
-than five survey answers). Training on the full
+than five survey answers, taking 128,442 down to 62,286 preprocessed). Training on the full
 window would mean editing the given code, so the run reports the truth instead:
 `split.rows_fitted` and `split.rows_held_out` are what the models saw, `data.rows` is what
 was read.
@@ -201,19 +201,19 @@ byte what the research code would have written on its own.
 
 ### What a full-scale run produces
 
-81,002 rows over the two-month window, 74,353 of them registered sessions, 15 brands.
+128,442 rows over the two-month window, 62,724 of them registered sessions, 10 brands.
 Evaluation mode, holding out the last 7 days:
 
 | | |
 |---|---|
-| acceptance classifier | accuracy 0.744, precision 0.609, recall 0.579, F1 0.594 |
-| positive rate in the test window | 32.3% |
-| payout regressor | MAE $21.60, MAPE 27.3% over 3,200 paid rows |
-| production run | 12 min; evaluation run 11 min; peak 9.5 GB resident |
+| acceptance classifier | accuracy 0.703, precision 0.409, recall 0.543, F1 0.467 |
+| positive rate in the test window | 24.0% |
+| payout regressor | MAE $5.25, MAPE 14.8% over 4,350 test rows |
+| production run | 6.0 min; evaluation run 3.7 min; peak 5.0 GB resident |
 
-These come from the synthetic extract, so the absolute values describe the generator as
-much as the models. What they establish is that the pipeline runs end to end at real
-volume and that the numbers land where the research code's own log puts them.
+These come from the real extract (`bl_full_data.csv`, delta version 0). What they
+establish is that the pipeline runs end to end at real volume and that the numbers land
+where the research code's own log puts them.
 
 One per-day bucket is not a day. The research split measures `split_day` in 24-hour
 offsets from the window's last *timestamp*, so the seventh bucket holds only the rows at
@@ -292,24 +292,25 @@ nothing else. Everything below follows from that one observation.
 
 ### The `fit_mode` ladder
 
-Measured on this box (4 CPU, 15 GB, context 1000x25, one request = 15 brand rows). All
+Measured on this box (12 vCPU, 16 GB, context 1000x25, one request = 10 brand rows). All
 three rows use `n_estimators=2`, so the only thing varying is `fit_mode`:
 
 | `fit_mode` | start-up | payout prediction | max diff vs reference |
 |---|---|---|---|
-| `low_memory` | 0.2 s | 37.3 s | $4.03 |
-| `fit_preprocessors` (library default) | 0.4 s | 8.69 s | reference |
-| `fit_with_cache` | 14.9 s | **0.26 s** | **$0.000045** |
+| `low_memory` | 0.1 s | 7.35 s | $0.213 |
+| `fit_preprocessors` (library default) | 3.1 s | 7.65 s | reference |
+| `fit_with_cache` | 7.95 s | **0.15 s** | **$0.000469** |
 
-`fit_with_cache` is a **33x** improvement over the library default for predictions that
-differ by 4.5e-5 on payouts of $60-140 — a relative error around 1e-6, far below any
-plausible ranking tie. It is the single biggest exact-preserving win available, and it is
-the one the research code leaves on the table. (`low_memory`, by contrast, is both
-slowest *and* materially different, so it is never the right choice here.)
+`fit_with_cache` is a **~51x** improvement at prediction time over the library default,
+for answers that differ by 4.7e-4 — far below any plausible ranking tie. It is the single
+biggest exact-preserving win available, and the one the research code leaves on the table:
+the context is encoded once at start-up rather than on every call. (`low_memory`, by
+contrast, is materially different — $0.21 max — so it is never the right choice here,
+even where its per-call time is comparable.)
 
 It does not rescue the request path. The shipped teacher configuration is
 `fit_with_cache` with `n_estimators=4`, and a **complete request** through it — features,
-classifier, payout, ranking — is **457 ms p50**, measured over 200 users. Against 2.41 ms
+classifier, payout, ranking — is **261 ms p50**, measured over 200 users. Against 2.7 ms
 for the served path. So `tabpfn_local` is the right backend for batch scoring and for
 teaching the surrogate, not for the funnel.
 
@@ -317,14 +318,14 @@ Per request, end to end, at the configuration each backend actually ships with:
 
 | backend | per request | accuracy |
 |---|---|---|
-| `surrogate` (CatBoost student) | **4.1 ms** | approximate, measured and logged |
-| `catboost_fallback` | ~4 ms | approximate; an availability path, not an accuracy claim |
+| `surrogate` (CatBoost student) | **2.7 ms** | approximate, measured and logged |
+| `catboost_fallback` | ~2.7 ms | approximate; an availability path, not an accuracy claim |
 | `tabpfn_client`, fit reused from the weekly job | one network round trip | exact |
-| `tabpfn_local`, `fit_with_cache`, `n_estimators=4` | 457 ms | exact |
+| `tabpfn_local`, `fit_with_cache`, `n_estimators=4` | 261 ms | exact |
 
 Both columns of that last table come from the same 200-user comparison, so they are
-directly comparable. (The 2.41 ms figure quoted elsewhere repeats a single user, which
-is the friendliest case for cache locality; 4.1 ms is the same code over 200 distinct
+directly comparable. (The 2.0 ms figure quoted elsewhere repeats a single user, which
+is the friendliest case for cache locality; 2.7 ms is the same code over 200 distinct
 ones.)
 
 ### What the approximation costs
@@ -332,10 +333,10 @@ ones.)
 Two measurements, and the gap between them is the interesting part.
 
 **At training time**, the student is compared against the teacher on held-out users
-drawn from the distillation sample: rank correlation 0.993, dollar error 6.2%, and the
-same top brand every time. That number is optimistic, and knowing why matters. The
-distillation sample is built from the payout context — rows that were actually paid for
-— so it is a narrower, higher-value slice than live traffic, and it compares *payout
+drawn from the distillation sample: rank correlation 0.986, dollar error 5.7%, and the
+same top brand every time. That number is optimistic on its own, and knowing why matters.
+The distillation sample is built from the payout context — rows that were actually paid
+for — so it is a narrower, higher-value slice than live traffic, and it compares *payout
 predictions* rather than the ranking those predictions produce.
 
 **End to end** is the number to quote. `scripts/compare_backends.py` scores 200
@@ -344,27 +345,28 @@ compares the rankings themselves:
 
 | | surrogate vs TabPFN teacher |
 |---|---|
-| same brand in position 1 | 84.5% |
-| same top 3, as a set | 82.0% |
-| identical ordering of all 15 | 3.5% |
-| **expected payout given up, averaged over all users** | **1.21%** |
-| ... when the two disagree | 7.83% |
-| ... p95 | 11.1% |
-| ... worst single user | 27.8% |
-| latency | 4.1 ms vs 456.7 ms (111x) |
+| same brand in position 1 | 99.5% |
+| same top 3, as a set | 99.0% |
+| identical ordering of all 10 | 74.0% |
+| **expected payout given up, averaged over all users** | **0.00%** |
+| ... when the two disagree | 0.41% |
+| ... p95 | 0.00% |
+| ... worst single user | 0.41% |
+| latency | 2.21 ms vs 261.3 ms (118x) |
 
 Read the regret row, not the agreement rows. Agreement counts treat "picked a brand
 worth two cents less" the same as "picked a much worse brand"; regret asks what the
-student's choice is actually worth *under the teacher's own scores*. The student
-disagrees about the first position for roughly one user in six, and when it does, it
-gives up about 8% of that user's expected payout — 1.21% averaged across everyone.
+student's choice is actually worth *under the teacher's own scores*. On this extract the
+student picks the same top brand for all but one user in two hundred, and even the single
+worst case gives up 0.41% of that user's expected payout — a mean regret that rounds to 0.00%.
 
-**So the trade is 1.21% of expected payout per session against 450 ms of added page
-latency.** Which side wins depends on the funnel's own latency-to-conversion curve,
-which is a number the business has and I do not. The default is the surrogate because
-450 ms on a landing page is very likely to cost more than 1.2%, but that is a judgement
-the numbers above are meant to let someone else overturn — and
-`BL_MODEL__PAYOUT__BACKEND=tabpfn_local` overturns it.
+**So on this data the trade is essentially free: a mean 0.00% (worst-case 0.41%) of
+expected payout per session against ~260 ms of added page latency.** Which side wins in
+general depends on the funnel's own latency-to-conversion curve, which is a number the
+business has and I do not. The default is the surrogate because
+~260 ms on a landing page is very likely to cost more than a fraction of a percent of
+payout, but that is a judgement the numbers above are meant to let someone else overturn —
+and `BL_MODEL__PAYOUT__BACKEND=tabpfn_local` overturns it.
 
 ### The four backends
 
@@ -470,25 +472,25 @@ bounded too, and still name enough of the value to act on. Refusing above the li
 
 ### What made it fast
 
-Measured in-process against the production model (81k training rows, a 70 MB
-classifier), models already warm, one request being one user scored against 15 brands:
+Measured in-process against the production model (55k training rows, a 70 MB
+classifier), models already warm, one request being one user scored against 10 brands:
 
 | path | p50 | p95 | p99 |
 |---|---|---|---|
-| the research pipeline as written | 53.7 ms | 57.3 ms | 59.4 ms |
-| what this system serves | **2.81 ms** | 3.04 ms | 3.48 ms |
+| the research pipeline as written | 66.8 ms | 71.8 ms | 79.5 ms |
+| what this system serves | **2.7 ms** | 3.38 ms | 3.82 ms |
 
-19x, and every step of it exact-preserving. Where the 2.8 ms goes — reproduce any of this
+26x, and every step of it exact-preserving. Where the 2.7 ms goes — reproduce any of this
 with `python scripts/profile_request.py`:
 
 | stage | p50 |
 |---|---|
-| build the user's 24 features | 0.063 ms |
-| broadcast them across 15 brands | 0.030 ms |
-| build one CatBoost `Pool` | 0.365 ms |
-| classifier `predict_proba` | 1.319 ms |
-| payout `predict` | 0.910 ms |
-| sort, rank, serialise | 0.069 ms |
+| build the user's 24 features | 0.083 ms |
+| broadcast them across 10 brands | 0.039 ms |
+| build one CatBoost `Pool` | 0.382 ms |
+| classifier `predict_proba` | 1.269 ms |
+| payout `predict` | 0.830 ms |
+| sort, rank, serialise | 0.078 ms |
 
 Two thirds of it is the two model calls, which is the right shape: there is no pandas
 overhead left to remove.
@@ -496,12 +498,12 @@ overhead left to remove.
 Three changes got it there, in order of what they were worth:
 
 1. **The feature pipeline runs over plain values instead of pandas.** The research
-   pipeline expresses a 15-row transform as roughly a hundred pandas calls: a cross join
-   (3.0 ms), a DataFrame construction from a dict (0.9 ms), four `to_datetime` calls
-   (0.6 ms each), `Series.apply(lambda: pd.Series(...))` for the gender feature (1.3 ms),
-   and about twenty `.loc[mask, col] = value` assignments across the four band mappings
-   (0.33 ms each). That cost is per *operation*, not per row, so it does not shrink with
-   the data. Feature construction is now 0.063 ms.
+   pipeline expresses a 10-row transform as roughly a hundred pandas calls: a cross join,
+   a DataFrame construction from a dict, four `to_datetime` calls, a
+   `Series.apply(lambda: pd.Series(...))` for the gender feature, and about twenty
+   `.loc[mask, col] = value` assignments across the four band mappings. That cost is per
+   *operation*, not per row, so it does not shrink with the data. Feature construction is
+   now 0.083 ms.
 2. **Everything request-independent moved to start-up** — the CatBoost load, the payout
    context fit, the brand universe, the warning handler. The research predictor does all
    of it inside `predict_()`, on every request.
@@ -518,23 +520,23 @@ research` switches back to the original at runtime.
 
 ### Cold start
 
-`nd = NameDataset()` at module import in both research scripts costs **10.8 s and 2.3 GB
-resident**. Three worker processes would need 6.8 GB, and each would pay the 10.8 s before
+`nd = NameDataset()` at module import in both research scripts costs **9.5 s and 2.1 GB
+resident**. Three worker processes would need 6.3 GB, and each would pay the 9.5 s before
 serving a single request.
 
 `detect_gender_with_confidence` is a pure function of one first name, and the dataset's
-first-name universe is finite (727,556 entries, which collapse to 714,191 distinct
-capitalised lookup keys), so the training job materialises the whole function into a table
-that ships inside the model bundle:
+first-name universe is finite (727,556 entries, of which 714,191 resolve to a known
+gender; the other 13,365 return `unknown` and are not stored — capitalisation is injective
+here, so this is a drop of the unknowns, not a collision of keys), so the training job
+materialises the whole function into a table that ships inside the model bundle:
 
 | | load cost | resident | per lookup |
 |---|---|---|---|
-| `NameDataset()` | 10.8 s | 2,261 MB | 70.5 µs |
-| precomputed table | 3.6 s | 349 MB | 0.235 µs |
+| `NameDataset()` | 9.5 s | 2,143 MB | 49.1 µs |
+| precomputed table | 3.6 s | 357 MB | 0.609 µs |
 
-Both columns measured on the same box in the same session, rotating nine first names
-including a hyphenated one and one the dataset does not know. 300× cheaper per lookup is
-the part that matters on the request path; 6.5× less resident memory per worker is the part
+Both columns measured on the same box in the same session. ~80× cheaper per lookup is
+the part that matters on the request path; 6× less resident memory per worker is the part
 that decides how many workers fit.
 
 The table is keyed by what the serving path actually looks up. The research code does
@@ -593,12 +595,13 @@ are nearest-rank, so every number printed is a real observation.
 make loadtest        # sweeps 25 -> 400 rps with 3 generator processes
 ```
 
-Over three identical sweeps, the service is flat to **250 rps** — p50 between 9.7 and
-11.5 ms, p99 under 50 ms, nothing erroring — and 300 rps is the edge: two sweeps and a
-60-second hold put it at p50 14–18 ms, a third at p50 41 ms and p99 750 ms. Full tables,
-the spread and the capacity reading are in [`docs/load-test.md`](docs/load-test.md).
+Over three identical sweeps, the service is flat to **300 rps** — p50 between 9.5 and
+12.5 ms, p99 under 81 ms, nothing erroring — and 400 rps is the edge: two of three sweeps
+offered it and split hard (p99 80 ms in one, 3.5 s in the other), while the third could not
+offer it at all. Full tables, the spread and the capacity reading are in
+[`docs/load-test.md`](docs/load-test.md).
 
-Caveat stated plainly: on a 4-core box the generator competes with the server, so 250 rps
+Caveat stated plainly: the generator shares the machine with the server, so 300 rps
 per three-worker box is a floor rather than a ceiling. It is also why the harness measures
 *itself* first — send lag, in-flight count and error share are on every row, and a row that
 fails any of those checks is reported as the generator's problem instead of as latency. Both
@@ -704,7 +707,7 @@ The ones that carry weight:
 | `test_gender_lut.py` | the precomputed table *is* `detect_gender_with_confidence` |
 | `test_null_sub_ids_...` | the train/serve skew above stays fixed |
 | `test_research_code_checksum_...` | the vendored scripts have not been edited |
-| `test_local_and_databricks_schedules...` | the two schedules cannot drift |
+| `test_the_bundle_and_the_config_schedule_at_the_same_moment` | the two schedules cannot drift |
 | `test_serving_degrades_rather_than_failing_when_a_backend_cannot_load` | a TabPFN outage at model load is a degraded ranking, not a 503 |
 
 ---

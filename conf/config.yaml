@@ -30,7 +30,7 @@ data:
 
 model:
   # Materialise the gender feature into a 4 MB lookup table shipped in the bundle.
-  # Costs ~47s per training run; removes names-dataset (18s, 2.4GB) from serving.
+  # Built once in the training job; removes names-dataset (9.5s, 2.1GB) from serving.
   build_gender_lookup: true
 
   # CatBoost hyper-parameters, mirrored from the research script so they appear
@@ -52,7 +52,7 @@ model:
     #   tabpfn_client     the research code's hosted API, with fit() lifted out of the
     #                     request path. Exact. One network round trip per request.
     #                     Needs TABPFN_TOKEN.
-    #   tabpfn_local      TabPFN weights in-process. Exact, no network, but ~457 ms
+    #   tabpfn_local      TabPFN weights in-process. Exact, no network, but ~261 ms
     #                     per request on CPU - batch scoring only, unless on GPU.
     #   catboost_fallback no TabPFN at all. The degraded path when the others are
     #                     unreachable, and what CI runs.
@@ -93,7 +93,7 @@ serving:
   threads_per_worker: 1
   # Load models from the registry at start-up; falls back to a local run directory.
   model_uri: null               # null -> models:/<registered_model>@<serving_alias>
-  # fast     - vectorised feature path, ~50ms of pandas overhead removed (default)
+  # fast     - vectorised feature path, ~64ms of pandas overhead removed (default)
   # research - the research pipeline verbatim; the reference the fast path is tested against
   feature_path: fast
   # Largest request body accepted. One funnel session is ~1 KB. Anything larger is read,

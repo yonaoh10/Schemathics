@@ -6,7 +6,7 @@ against the model actually in the bundle. This reproduces them:
 
     python scripts/profile_request.py                  # 200 distinct users
     python scripts/profile_request.py --users 1        # one user, repeated: cache-friendly
-    python scripts/profile_request.py --no-research    # skip the 2.4 GB names-dataset import
+    python scripts/profile_request.py --no-research    # skip the 2.1 GB names-dataset import
 
 The stages are the same calls `BrandRanker._rank_fast` makes, timed individually and then
 compared against one timed `rank()` so the parts are known to add up. The research figure
@@ -102,7 +102,7 @@ def main() -> None:
                         help="passes over the user list, after one discarded warm-up pass")
     parser.add_argument("--no-research", action="store_true",
                         help="skip the research-path comparison (imports names-dataset: "
-                             "18 s and 2.4 GB)")
+                             "9.5 s and 2.1 GB)")
     args = parser.parse_args()
 
     settings = Settings.load()

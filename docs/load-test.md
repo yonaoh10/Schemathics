@@ -72,7 +72,7 @@ days, so half of them had the survey submitted before the session that showed it
 the schema correctly refuses. The sweep measured a service answering 422s at half the
 offered rate and called it capacity.
 
-**Stated caveat.** The generator runs on the same four cores as the server, so above a few
+**Stated caveat.** The generator runs on the same machine as the server, so above a few
 hundred requests per second the two compete. Numbers past that point understate what the
 service would do on its own hardware. They are reported anyway, marked, rather than
 quietly trimmed.
@@ -81,13 +81,13 @@ quietly trimmed.
 
 | | |
 |---|---|
-| hardware | 4 vCPU, 15 GB |
+| hardware | 12 vCPU, 16 GB (macOS 14.2, x86_64) |
 | workers | 3 uvicorn processes, 1 BLAS thread each |
 | server | uvloop, httptools, access log off, ORJSON responses |
 | feature path | `fast` (the vectorised path; equivalence-tested against the research one) |
 | payout backend | `surrogate` — the shipped default: a CatBoost student distilled from the TabPFN teacher (`catboost_fallback` is within noise of it) |
-| model | version 3, 15 brands. 81,002 rows ingested, 73,492 with enough survey answers to preprocess, 65,727 fitted and 7,765 held out by the 7-day split |
-| brands per request | 15 |
+| model | version 1, 10 brands. 128,442 rows ingested, 62,286 with enough survey answers to preprocess, 55,368 fitted and 6,918 held out by the 7-day split |
+| brands per request | 10 |
 | payloads | 200 distinct users, so the run is not one perfectly cached code path |
 | generators | 3 processes, 384 connections each |
 
@@ -101,101 +101,103 @@ values in milliseconds, and no request errored anywhere in any of the three runs
 
 | target rps | achieved | clnt p50 | clnt p99 | handler p50 | runs usable |
 |---|---|---|---|---|---|
-| 25 | 25.0 | 10.6 (10.1–10.9) | 17.9 (16.6–21.4) | 6.8 | 3 of 3 |
-| 50 | 48.7 | 9.7 (8.9–10.8) | 17.8 (16.4–21.1) | 6.4 | 3 of 3 |
-| 100 | 98.6 | 9.8 (9.0–10.0) | 21.3 (20.9–22.0) | 6.6 | 3 of 3 |
-| 200 | 196.0 | 10.4 (10.2–13.7) | 33.2 (27.9–47.3) | 6.8 | 3 of 3 |
-| 300 | 293.2 (288–293) | 15.0 (13.8–40.7) | 53.6 (48.0–**750**) | 10.5 | 3 of 3 |
-| 350 | 343.2 (2 of 3) | 38.6 (31.5–38.6) | 326 (129–326) | 29.2 | 2 of 3 |
-| 400 | — | — | — | 41.4 | **0 of 3** |
+| 25 | 25.0 | 9.66 (9.48–10.17) | 22.27 (16.28–30.04) | 8.68 | 3 of 3 |
+| 50 | 48.7 | 9.46 (8.86–10.60) | 19.62 (19.22–43.64) | 8.45 | 3 of 3 |
+| 100 | 98.6 | 10.04 (9.96–12.24) | 55.87 (27.43–56.03) | 9.30 | 3 of 3 |
+| 200 | 196.0 | 11.34 (9.38–12.78) | 55.38 (35.34–59.94) | 10.62 | 3 of 3 |
+| 300 | 293.3 | 12.50 (12.15–13.01) | 80.72 (61.00–121.55) | 11.72 | 3 of 3 |
+| 350 | 343.4 | 12.11 (10.97–15.60) | 98.39 (28.64–**510**) | 11.40 | 3 of 3 |
+| 400 | 365–394 | 11.3 / 17.9 | 80.45 / **3534** | 10.6 / 16.8 | 2 of 3 |
+
+The 400 rps row shows its two usable runs rather than a median: the third could not offer
+the rate at all — its generator fell behind (p99 send lag 335 ms) and the harness marked
+it `GENERATOR LATE` rather than charging the backlog to the server. Of the two that did
+offer it, one held p99 at 80 ms and the other blew out to 3.5 s, which is the signature of
+a rate at the edge, not a capacity number.
 
 And two single rates held for a full minute rather than 30 s, to separate a transient
 backlog from a steady state:
 
 | rate | duration | achieved | clnt p50 | clnt p99 | handler p50 |
 |---|---|---|---|---|---|
-| 250 | 60 s | 247.3 | 11.5 | 48.8 | 7.5 |
-| 300 | 60 s | 298.4 | 17.8 | 64.9 | 12.8 |
+| 250 | 60 s | 247.3 | 13.70 | 164.38 | 13.05 |
+| 300 | 60 s | 298.4 | 10.42 | 68.51 | 9.79 |
 
 ## Reading it
 
-**Up to 250 rps the service is flat and boring, which is the good outcome.** p50 sits
-between 9.7 and 11.5 ms at every rate from 25 to 250, p99 under 50 ms, handler time 6.4 to
-7.5 ms, achieved rate equal to target, nothing erroring — and the 60-second hold at 250 rps
-looks the same as the 30-second one, so it is a steady state and not a queue that had not
-filled yet.
+**Up to 300 rps the service is flat and boring, which is the good outcome.** p50 sits
+between 9.5 and 12.5 ms at every rate from 25 to 300, p99 under 81 ms, handler time 8.4 to
+11.7 ms, achieved rate equal to target, nothing erroring — and the 60-second hold at 300 rps
+(p50 10.4 ms, p99 68.5 ms) looks the same as the 30-second sweep, so it is a steady state
+and not a queue that had not filled yet.
 
-**300 rps is the edge, and the spread says so.** Two sweeps put it at p50 14–15 ms and p99
-48–54 ms, and a 60-second hold at 300 agreed (17.8 / 64.9). The third sweep, same command
-on the same box, came back at p50 41 ms and p99 750 ms with the handler itself at 24 ms.
-Nothing errored in that run either; the queue simply built and drained. A rate whose p99
-moves by 14× between identical runs is a rate to plan below, not a capacity figure.
+**350 rps mostly holds, but the spread is starting to show.** All three sweeps delivered
+343 rps at p50 11–16 ms, and two of them kept p99 under 100 ms — but one came back at p99
+510 ms with nothing erroring, the queue simply building and draining. A rate whose p99 moves
+by 5× between identical runs is the edge announcing itself.
 
-**350 rps is where this box stops being able to ask the question.** The service still
-delivered 343 rps in two runs of three, at p50 31–39 ms and p99 129–326 ms. In the third the
-*generator* fell behind its own schedule — 3 server workers and 3 generator processes want
-more than four cores — and the row was marked `GENERATOR LATE` rather than reported. At 400
-rps that happened in all three runs, so the table has no latency for it at all. What the
-handler header still shows is the server absorbing the contention: 41 ms p50 against 6.8 ms
-at 200 rps.
+**400 rps is that edge.** Two of three sweeps offered it (365 and 394 rps achieved) and
+split hard: one held p99 at 80 ms, the other blew out to 3.5 s. The third sweep could not
+offer 400 at all — its *generator* fell behind its own schedule (p99 send lag 335 ms), and
+the harness marked that row `GENERATOR LATE` rather than charging the backlog to the server,
+which is the whole reason the send lag is measured. A rate that swings 80 ms → 3.5 s across
+runs, and that the generator itself struggles to produce, is a rate to plan below.
 
-**So: plan on 250 rps per three-worker box, with 300 as the headroom you do not use.** Both
-numbers are floors rather than ceilings — the generator is on the same four cores, and on
-dedicated hardware the service would go further — but a floor measured three times is worth
-more than a ceiling measured once. The way to get more is more worker processes on more
-cores, because the work is CPU-bound and scales by process.
+**So: plan on 300 rps per three-worker box, with 350 as headroom you do not lean on.** Both
+are floors rather than ceilings — the generator shares the machine, so on dedicated hardware
+the service would go further — but a floor measured three times is worth more than a ceiling
+measured once. The way to get more is more worker processes on more cores, because the work
+is CPU-bound and scales by process.
 
-**Operating point.** At 100 rps — comfortably inside capacity — p50 is 9.8 ms and p99 is
-21.3 ms end to end, with the handler itself at 6.6 ms p50. The two gaps are worth keeping
+**Operating point.** At 100 rps — comfortably inside capacity — p50 is 10.0 ms and p99 is
+55.9 ms end to end, with the handler itself at 9.3 ms p50. The two gaps are worth keeping
 apart. `X-Process-Time-Ms` is stamped by the outermost middleware, so it already contains
-body parsing and Pydantic validation: against 2.8 ms of scoring measured in-process, 3.8 of
-those 6.6 ms are the HTTP layer. The 3.2 ms beyond the header is loopback, connection
-handling and OS queueing across three workers sharing four cores with the load generator, of
-which 0.8 ms is the generator's own send lag.
+body parsing and Pydantic validation: against ~2.7 ms of scoring measured in-process, the
+other ~6.6 ms of that 9.3 ms is the HTTP layer — reading the body and validating 22 fields.
+The ~0.7 ms between the header and the client figure is loopback, connection handling and OS
+queueing, of which ~0.6 ms is the generator's own send lag.
 
 **What earlier versions of this document got wrong, twice.** The first reported capacity as
 "between 200 and 300 rps, and the failure is a cliff", with p50 going to 6.6 s at a 300 rps
 target — that was a single generator process falling behind its own schedule and billing the
-wait to the server. The second, after the harness grew three generator processes and learned
-to report its own send lag, swung the other way and read a single 20-second run as 387 rps
-at 47 ms. Both were one run. The answer that survived repetition is the modest one in this
-section, and the reason to publish the spread rather than the best cell is that the best cell
-is what both mistakes had in common.
+wait to the server. The second, on the same small box, swung the other way and read a single
+20-second run as 387 rps at 47 ms. Both were one run. The answer that survives repetition is
+the modest one, and the reason to publish the spread rather than the best cell is that the
+best cell is what both mistakes had in common.
 
 ## Where the time goes
 
-In-process, models warm, one request = one user scored against 15 brands, against the
+In-process, models warm, one request = one user scored against 10 brands, against the
 production model above. Reproduce with `python scripts/profile_request.py`:
 
 | stage | p50 | p95 | p99 |
 |---|---|---|---|
-| build the user's features (`fast_features.build_feature_row`) | 0.063 ms | 0.103 ms | 0.113 ms |
-| broadcast across the 15 brands (`batch.from_row`) | 0.030 ms | 0.042 ms | 0.070 ms |
-| CatBoost `Pool` construction, shared by both models | 0.365 ms | 0.441 ms | 0.485 ms |
-| classifier `predict_proba` | 1.319 ms | 1.500 ms | 1.676 ms |
-| payout `predict` | 0.910 ms | 1.015 ms | 1.048 ms |
-| sort, rank, serialise | 0.069 ms | 0.108 ms | 0.124 ms |
-| **total in-process** | **2.766 ms** | **3.111 ms** | **3.313 ms** |
-| the same work through `ranker.rank()` | 2.809 ms | 3.039 ms | 3.478 ms |
+| build the user's features (`fast_features.build_feature_row`) | 0.083 ms | 0.147 ms | 0.196 ms |
+| broadcast across the 10 brands (`batch.from_row`) | 0.039 ms | 0.060 ms | 0.081 ms |
+| CatBoost `Pool` construction, shared by both models | 0.382 ms | 0.624 ms | 0.760 ms |
+| classifier `predict_proba` | 1.269 ms | 1.741 ms | 2.051 ms |
+| payout `predict` | 0.830 ms | 1.118 ms | 1.280 ms |
+| sort, rank, serialise | 0.078 ms | 0.163 ms | 0.192 ms |
+| **total in-process** | **2.786 ms** | **3.382 ms** | **3.823 ms** |
+| the same work through `ranker.rank()` | 2.564 ms | 3.349 ms | 3.501 ms |
 
-The last row is the check that the parts add up: timing the stages individually and timing
-the whole call agree to within 50 µs. Two runs of the script minutes apart gave 2.766 and
-2.777 ms, which is the spread to assume on any figure here.
+The last row is the check that the parts add up. The sum of the separately-timed stages
+(2.786 ms) runs about 0.22 ms *above* the single `ranker.rank()` call (2.564 ms) — the cost
+of the per-stage timing itself, not a discrepancy. Three runs of the script gave a total p50
+of 2.786, 2.705 and 2.676 ms, a spread of 110 µs, which is what to assume on any figure here.
 
 Two thirds of the request is the two model calls, which is the right shape — there is no
 pandas overhead left to remove. Repeating a *single* user instead of 200 distinct ones
-gives 2.411 ms, the friendliest possible case for cache locality and the figure to use when
+gives 2.0 ms, the friendliest possible case for cache locality and the figure to use when
 comparing against a micro-benchmark rather than against traffic.
 
 The same request through the unmodified research pipeline — with the models already warm,
-so this excludes the per-request model loading it would also do — is **53.7 ms p50**, 19×
+so this excludes the per-request model loading it would also do — is **66.8 ms p50**, 26×
 the served path. The difference is pandas per-operation overhead, not arithmetic;
-`serving/fast_features.py` explains it line by line.
-
-Over 200 distinct users this path measured 4.1 ms before the gender lookup stopped
-materialising its table through `to_pylist()` on every load and started reading the Arrow
-dictionary directly. The repeated-user figure was unchanged by that fix at 2.41 ms, which
-is exactly the signature of a cost paid per *distinct* name.
+`serving/fast_features.py` explains it line by line. (An earlier version of this document
+quoted 4.1 ms for the served path: that was measured before the gender lookup stopped
+materialising its table through `to_pylist()` on every load, and is not what the code does
+now — the 200-user figure with the fix in place is 2.7 ms.)
 
 ## Payout backends
 
@@ -203,15 +205,14 @@ The choice of payout backend dominates everything else, which is why the surroga
 
 | backend | payout prediction | total request |
 |---|---|---|
-| `surrogate` / `catboost_fallback` | 0.91 ms | 2.81 ms |
-| `tabpfn_local`, `fit_with_cache`, `n_estimators=4` (exact) | ~455 ms | 457 ms |
-| `tabpfn_local`, `fit_with_cache`, `n_estimators=2` | 260 ms | ~262 ms |
-| `tabpfn_local`, `fit_preprocessors`, `n_estimators=2` | 8,690 ms | ~8,692 ms |
+| `surrogate` / `catboost_fallback` | 0.83 ms | 2.7 ms |
+| `tabpfn_local`, `fit_with_cache`, `n_estimators=4` (exact, shipped teacher) | ~259 ms | 261 ms |
+| `tabpfn_local`, `fit_with_cache`, `n_estimators=2` | 150 ms | ~152 ms |
+| `tabpfn_local`, `fit_preprocessors`, `n_estimators=2` | 7,650 ms | ~7,652 ms |
 | `tabpfn_client` | one network round trip | request + RTT |
 
-Both columns are over 200 distinct users: the payout column is that stage alone, the total
-is `ranker.rank()` end to end, which is why the first row's 2.81 ms matches the table above
-rather than its 2.77 ms sum of stages. The `n_estimators=2` rows come from the `fit_mode`
-comparison, which holds the ensemble size fixed so that the only
-variable is the fit mode. See the README section "Productizing TabPFN" for how those were
-measured and what the trade-off costs in accuracy.
+The surrogate/teacher rows over 200 distinct users come from `scripts/compare_backends.py`
+(surrogate p50 2.21 ms, teacher p50 261.3 ms, a 118× gap). The `n_estimators=2` rows come
+from the `fit_mode` comparison, which holds the ensemble size fixed so that the only variable
+is the fit mode. See the README section "Productizing TabPFN" for how those were measured and
+what the trade-off costs in accuracy.
