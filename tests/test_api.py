@@ -277,18 +277,41 @@ def test_an_unexpected_failure_on_the_bare_endpoint_is_counted(client, monkeypat
     assert response.status_code == 500
     assert 'bl_rank_requests_total{outcome="error"}' in client.get("/metrics").text
 
-@pytest.mark.parametrize("value", ["1" + "0" * 400, "9" * 20, "junk"])
+@pytest.mark.parametrize("value", ["9" * 100, "9" * 20, "junk"])
 def test_a_campaign_id_too_large_for_int64_degrades_like_training(client, value):
     """The training column is int64, so a larger id is the 0 level there.
 
     Without the same bound at serving the Python int reached CatBoost, which raised on
     anything past float range - a 500 leaking a library message - and silently scored
     everything below it differently from how training saw it.
+
+    The values here are all over the int64 bound (or unparseable) but under the
+    MAX_TEXT_CHARS cap, so they reach the normaliser and degrade to 0. A campaign_id
+    longer than that cap is refused earlier, by the DoS guard - see the test below.
     """
     from bl_ranking.serving.schemas import RankRequest
 
     assert RankRequest(**(dict(WARMUP_USER) | {"campaign_id": value})).campaign_id == 0
     assert client.post("/rank", json=dict(WARMUP_USER) | {"campaign_id": value}).status_code == 200
+
+
+def test_a_campaign_id_longer_than_the_text_cap_is_refused(client):
+    """A pathologically long campaign_id is a clean 422, not a silent degrade to 0.
+
+    The model-level length guard runs ahead of `normalise_campaign_id`, so a 401-digit
+    string never reaches `_as_int64`. That ordering is deliberate: CPython parses an int
+    from a digit string in quadratic time (and refuses past 4,300 digits outright), so
+    the cheap length check has to come first. A caller who sends one gets the field named
+    and a 422, rather than the request being accepted and quietly scored as campaign_id 0.
+    """
+    from pydantic import ValidationError
+
+    huge = "1" + "0" * 400
+    with pytest.raises(ValidationError, match="campaign_id is"):
+        RankRequest(**(dict(WARMUP_USER) | {"campaign_id": huge}))
+    assert client.post(
+        "/rank", json=dict(WARMUP_USER) | {"campaign_id": huge}
+    ).status_code == 422
 
 
 def test_a_timestamp_pair_that_cannot_be_subtracted_is_refused(client):
