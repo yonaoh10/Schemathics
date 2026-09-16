@@ -5,7 +5,7 @@ Both research scripts do this at module import (line 5):
     from names_dataset import NameDataset
     nd = NameDataset()
 
-Measured on this machine, that single line costs **18.6 s and 2.4 GB of resident
+Measured on this machine, that single line costs **9.5 s and 2.1 GB of resident
 memory**. In a script it is a one-off annoyance. In a serving container it is the
 dominant cold-start cost, it multiplies by the number of worker processes, and it sets
 the memory floor for the whole deployment.
@@ -14,8 +14,8 @@ the memory floor for the whole deployment.
 first-name universe is finite and enumerable (727,556 entries). So the whole function
 can be materialised once, offline, into a table:
 
-    714,212 entries -> 4.2 MB parquet -> 290 MB resident, 3.9 s to load
-    per-lookup cost drops from 77 us to 0.09 us
+    714,191 entries -> 4.2 MB parquet -> 357 MB resident, 3.6 s to load
+    per-lookup cost drops from 49 us to 0.6 us
 
 Names absent from the table return ('unknown', 0.0) - which is exactly what the
 research implementation returns for a name the dataset does not know. The table is
@@ -88,7 +88,7 @@ class GenderLookup:
     def live(cls) -> GenderLookup:
         """A lookup backed by names-dataset itself, for a bundle built without a table.
 
-        Same interface, same answers, and the same 2.4 GB the table exists to avoid -
+        Same interface, same answers, and the same 2.1 GB the table exists to avoid -
         which is why it is only reached when `model.build_gender_lookup` was off. The
         alternative, and what used to happen, is that the vectorised path answered
         'unknown' for every name while the research path did the real lookup, so the
@@ -126,6 +126,29 @@ class GenderLookup:
                 f"{path} has {table.column('name').null_count} null name key(s); the "
                 f"lookup would never match them."
             )
+        # The name column has to be a string type, or every serving lookup - which passes
+        # `str(x).strip().capitalize()` - misses. A table whose name column arrived as int
+        # (name and something numeric transposed) passes every check above: right columns,
+        # right row count, no null keys - and then answers 'unknown' for every request.
+        name_type = table.column("name").type
+        if not (pa.types.is_string(name_type) or pa.types.is_large_string(name_type)):
+            raise ValueError(
+                f"{path} has a {name_type} name column, not a string one; every lookup "
+                f"passes a string key, so nothing would ever match. The likeliest cause is "
+                f"the name column transposed with a numeric one."
+            )
+        # Null gender or confidence is a mapping-level fault the file-shape checks miss: the
+        # gender-domain check subtracts None before comparing, so an all-null gender column
+        # passes it and then every name resolves to (None, ...) - a value the research code
+        # never returns. Checked here rather than only in the domain set.
+        for column in ("gender", "confidence"):
+            nulls = table.column(column).null_count
+            if nulls:
+                raise ValueError(
+                    f"{path} has {nulls:,} null {column} value(s); the research code's "
+                    f"detect_gender_with_confidence never returns a null {column}, so this "
+                    f"table was not written by build()."
+                )
         metadata = table.schema.metadata or {}
         recorded = metadata.get(ROW_COUNT_FIELD)
         if recorded is not None and int(recorded) != table.num_rows:
@@ -146,10 +169,19 @@ class GenderLookup:
         names = table.column("name").to_pylist()
         genders = table.column("gender").to_pylist()
         confidences = table.column("confidence").to_pylist()
-        return cls(
-            dict(zip(names, zip(genders, confidences, strict=False), strict=False)),
-            key_scheme_current=current,
-        )
+        mapping = dict(zip(names, zip(genders, confidences, strict=False), strict=False))
+        # The map, not the file. A table with the right row count but many duplicate keys -
+        # in the limit, every row the same key - collapses on the dict build to a handful of
+        # entries (one, in that limit), and every file-shape check above passed. Comparing
+        # the map size against the row count is what catches that; it is the one check that
+        # is about what load() is about to return rather than about the parquet it read.
+        if len(mapping) != table.num_rows:
+            raise ValueError(
+                f"{path} has {table.num_rows:,} rows but only {len(mapping):,} distinct "
+                f"name keys; the duplicates collapse on load, so most names it claims to "
+                f"cover would resolve to 'unknown'."
+            )
+        return cls(mapping, key_scheme_current=current)
 
     @classmethod
     def build(cls, path: str | Path | None = None, dataset=None) -> GenderLookup:
@@ -157,7 +189,7 @@ class GenderLookup:
 
         Reuses an already-loaded NameDataset when there is one. The training job imports
         the research module, which builds one at module scope, so constructing a second
-        would add another 2.4 GB to a process that already peaks around 7.5 GB.
+        would add another 2.1 GB to a process that already peaks around 5.0 GB.
         """
         dataset = dataset or _loaded_dataset() or _new_dataset()
         names: list[str] = []
@@ -169,7 +201,7 @@ class GenderLookup:
         # The research code does `str(x).strip().capitalize()` before the lookup, and
         # `capitalize()` lowercases everything after the first letter. names-dataset
         # normalises internally so `search("Anne-marie")` still finds "Anne-Marie", but
-        # a dict keyed on the raw spelling does not: 102,602 of its 727,556 names -
+        # a dict keyed on the raw spelling does not: 141,897 of its 727,556 names -
         # every hyphenated and multi-word first name among them - differ from their own
         # capitalisation and silently missed. Building on the capitalised key and
         # asking `_detect` with that exact key makes the table exact by construction,
@@ -229,7 +261,7 @@ def _loaded_dataset():
     """The NameDataset the research modules build at import, if either is loaded.
 
     Both scripts do `nd = NameDataset()` at module scope. Finding it here is not a
-    hack around their design - it is the only way to avoid paying that 2.4 GB twice in
+    hack around their design - it is the only way to avoid paying that 2.1 GB twice in
     a process that has already imported one of them.
     """
     for module_name in ("bl_ranking.research.bl_models_train",
@@ -292,8 +324,14 @@ def _warn_if_stale(table, path) -> bool:
     A table keyed on the dataset's own spelling is indistinguishable from a correct one
     by inspection: same row count, same columns, same file size. It simply answers
     'unknown' for every name whose capitalisation differs from its own - 141,897 of
-    727,556, every hyphenated and multi-word first name among them - while the research
-    path answers correctly, so the two feature implementations disagree silently.
+    727,556, every hyphenated and multi-word first name among them.
+
+    Both feature paths are affected equally: the research path
+    (`research_path.ServingPredictor.detect_gender_with_confidence`) returns
+    `self.warm.gender.lookup(fname)` from this same table whenever the bundle carries one,
+    so switching to `feature_path: research` does not recover the lost names - it pays
+    names-dataset's 9.5 s and 2.1 GB per worker for the identical degraded answer. The
+    only remedy is to retrain, which rebuilds the table on the correct key.
 
     Warned rather than refused: an old bundle still serves, and refusing to load one
     would turn a degraded feature into an outage. The next training run rebuilds it.
@@ -303,8 +341,8 @@ def _warn_if_stale(table, path) -> bool:
         return True
     log.warning(
         "%s predates the lookup-key fix (no %s marker). Roughly a fifth of first names "
-        "will resolve to 'unknown' on the vectorised path while the research path "
-        "resolves them correctly. Retrain to rebuild the table.",
+        "will resolve to 'unknown' on both feature paths - the research path reads this "
+        "same table - so switching feature_path does not help. Retrain to rebuild it.",
         path, KEY_SCHEME_FIELD.decode(),
     )
     return False

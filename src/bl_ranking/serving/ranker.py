@@ -11,7 +11,7 @@ that does not depend on the request to start-up:
 
   built once, at start-up          paid per request
   ----------------------          ----------------
-  CatBoost model load             ~15 rows of feature engineering
+  CatBoost model load             ~10 rows of feature engineering
   payout context fit              1 predict_proba
   all_clients.csv read            1 payout predict
   gender lookup table             sort + rank
@@ -20,7 +20,7 @@ that does not depend on the request to start-up:
 Two feature paths are available (`serving.feature_path`). The default, `fast`, is
 serving/fast_features.py. The reference, `research`, runs the original pipeline and
 lives in serving/research_path.py, which is imported on demand - importing it costs
-18 s and 2.4 GB because the research module builds a NameDataset at module scope.
+9.5 s and 2.1 GB because the research module builds a NameDataset at module scope.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ class BrandRanker:
     Two feature paths, selected by `serving.feature_path`:
 
       fast      serving/fast_features.py - the same transformation over plain values,
-                ~50 ms of pandas overhead removed. Default.
+                ~64 ms of pandas overhead removed. Default.
       research  the research pipeline exactly as written. The reference the fast path
                 is tested against, and the escape hatch if anything is ever in doubt.
 
@@ -154,7 +154,7 @@ class BrandRanker:
             # implementations disagreed on a model feature with nothing to show for it.
             log.warning(
                 "%s not in the bundle; using the live names-dataset lookup instead "
-                "(18s start-up, 2.4GB resident). Rebuild with model.build_gender_lookup "
+                "(9.5s start-up, 2.1GB resident). Rebuild with model.build_gender_lookup "
                 "enabled to avoid both.", GENDER_ARTIFACT,
             )
             try:
@@ -231,7 +231,7 @@ class BrandRanker:
 
     def _rank_via_research_pipeline(self, user: dict[str, Any]) -> dict[str, dict[str, float]]:
         # Imported here, not at module scope: the research predictor module runs
-        # `nd = NameDataset()` at import, which costs 18 s and 2.4 GB. The fast path
+        # `nd = NameDataset()` at import, which costs 9.5 s and 2.1 GB. The fast path
         # never needs it, so a default serving process never pays for it.
         from bl_ranking.serving.research_path import ServingPredictor
 
@@ -277,10 +277,11 @@ def _gender_source(gender: GenderLookup | None) -> str:
     """What GET /model says about the gender feature.
 
     Three states, not two. A table built before the lookup-key fix answers 'unknown'
-    for roughly a fifth of first names while the research path answers correctly, and
-    it is indistinguishable from a good one by row count or file size - so the one
-    place that can tell says so, where an operator comparing a rollback against a
-    champion will see it.
+    for roughly a fifth of first names - on both feature paths, since the research path
+    reads this same table - and it is indistinguishable from a good one by row count or
+    file size, so the one place that can tell says so, where an operator comparing a
+    rollback against a champion will see it. `precomputed_stale_key` means retrain, not
+    "switch to the research path": that path is no better here.
     """
     if gender is None:
         return "names_dataset"

@@ -264,3 +264,51 @@ def test_a_gender_table_with_the_columns_swapped_is_refused(tmp_path):
                         ["male", "female"], ["John", "Mary"], [0.9, 0.8], rows=2)
     with pytest.raises(ValueError, match="wrong way round"):
         GenderLookup.load(path)
+
+
+def test_a_table_whose_keys_all_collapse_is_refused(tmp_path):
+    """The one check that is about the map load() returns, not the file it read. A parquet
+    with the right row count but every key identical passes every file-shape guard and then
+    collapses to one entry on the dict build, resolving all but one name to 'unknown' while
+    GET /model reports a healthy 'precomputed'."""
+    import pytest
+
+    from bl_ranking.models.gender_lut import GenderLookup
+
+    path = _write_table(tmp_path / "collapse.parquet",
+                        ["John"] * 100, ["male"] * 100, [0.9] * 100, rows=100)
+    with pytest.raises(ValueError, match="distinct name keys"):
+        GenderLookup.load(path)
+
+
+def test_a_gender_table_with_a_numeric_name_column_is_refused(tmp_path):
+    """A name column that arrived as int (name and a numeric column transposed) has no null
+    keys and the right row count, so it passed every check - and then missed every serving
+    lookup, which always passes a string key."""
+    import pytest
+
+    from bl_ranking.models.gender_lut import GenderLookup
+
+    path = _write_table(tmp_path / "intname.parquet",
+                        [1, 2, 3], ["male", "female", "male"], [0.9, 0.8, 0.7], rows=3)
+    with pytest.raises(ValueError, match="not a string one"):
+        GenderLookup.load(path)
+
+
+def test_a_gender_table_with_null_values_is_refused(tmp_path):
+    """An all-null gender column slips past the domain check, which subtracts None before
+    comparing, and then resolves every name to (None, ...) - a value the research code never
+    returns. Null confidence is refused for the same reason."""
+    import pytest
+
+    from bl_ranking.models.gender_lut import GenderLookup
+
+    null_gender = _write_table(tmp_path / "nullg.parquet",
+                               ["John", "Mary"], ["male", None], [0.9, 0.8], rows=2)
+    with pytest.raises(ValueError, match="null gender"):
+        GenderLookup.load(null_gender)
+
+    null_conf = _write_table(tmp_path / "nullc.parquet",
+                             ["John", "Mary"], ["male", "female"], [0.9, None], rows=2)
+    with pytest.raises(ValueError, match="null confidence"):
+        GenderLookup.load(null_conf)
