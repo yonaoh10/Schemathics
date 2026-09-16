@@ -45,14 +45,26 @@ train = [
 serve = [
   "fastapi==0.115.6",
   "uvicorn[standard]==0.34.0",
-  "pydantic==2.10.4",
+  # 2.13, not 2.10: the training extra installs tabpfn-client, which requires
+  # pydantic>=2.11.7,<=2.13.4, and the combined local install (`make setup` pulls
+  # train+serve+dev into one venv) is unsatisfiable against a 2.10 pin - `pip` /
+  # `uv` both refuse to resolve. The serving code was already written for 2.13
+  # (schemas.py notes the union-field warning that arrived in that line), so this
+  # pin matches the code rather than moving it.
+  "pydantic==2.13.4",
   "orjson==3.10.13",
   "prometheus-client==0.21.1",
   "httpx==0.28.1",
   "mlflow-skinny==2.19.0",
 ]
 # Local TabPFN. Large (torch); install only where the default backend is used.
-tabpfn = ["tabpfn==8.5.0"]
+# 2.2.1, not a later 8.x: tabpfn>=6 requires torch>=2.5, and torch stopped publishing
+# macOS x86_64 wheels after 2.2.2 - so an 8.x pin is uninstallable on an Intel Mac and
+# on any box without a torch>=2.5 wheel. 2.2.1 needs only torch>=2.1,<3, is the version
+# the serving restore and save/load-fitted paths were verified against, and exposes the
+# same TabPFNRegressor / save_fitted_tabpfn_model / load_fitted_tabpfn_model API the code
+# uses. scikit-learn<1.7 is satisfied by the pinned 1.5.2.
+tabpfn = ["tabpfn==2.2.1"]
 dev = [
   "pytest==8.3.4",
   "ruff==0.8.4",

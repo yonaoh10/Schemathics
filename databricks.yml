@@ -149,7 +149,7 @@ resources:
               ResourceClass: SingleNode
             spark_env_vars:
               # The training job is single-node pandas and CatBoost; Spark is only the
-              # host. The run peaks around 9.5 GB on a two-month window: 2.4 GB of that
+              # host. The run peaks around 5.0 GB on a two-month window: 2.1 GB of that
               # is the names-dataset import the research code does at module scope.
               #
               # BL_CONFIG matters: the tasks run from a wheel in site-packages, which
@@ -200,7 +200,7 @@ resources:
             - pypi: {package: "names-dataset==3.1.0"}
             - pypi: {package: "tabpfn-client==0.5.3"}
             - pypi: {package: "apscheduler==3.11.0"}
-            - pypi: {package: "tabpfn==8.5.0"}
+            - pypi: {package: "tabpfn==2.2.1"}
 
         # 2. Fit, register a version, move the champion alias. Not "train on everything":
         #    the research code holds the last 7 days back in both modes - see
@@ -223,7 +223,7 @@ resources:
             - pypi: {package: "names-dataset==3.1.0"}
             - pypi: {package: "tabpfn-client==0.5.3"}
             - pypi: {package: "apscheduler==3.11.0"}
-            - pypi: {package: "tabpfn==8.5.0"}
+            - pypi: {package: "tabpfn==2.2.1"}
 
         # 3. Evaluation on the same data, for the researcher log and the comparable
         #    metrics. Runs after registration so a slow evaluation never delays the
@@ -246,7 +246,7 @@ resources:
             - pypi: {package: "names-dataset==3.1.0"}
             - pypi: {package: "tabpfn-client==0.5.3"}
             - pypi: {package: "apscheduler==3.11.0"}
-            - pypi: {package: "tabpfn==8.5.0"}
+            - pypi: {package: "tabpfn==2.2.1"}
 
   model_serving_endpoints:
     bl_brand_ranker:
