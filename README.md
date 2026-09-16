@@ -74,18 +74,18 @@ curl -s localhost:8080/rank -H 'content-type: application/json' -d '{
 ```json
 {
   "ranking": {
-    "sba central":     {"rank": 1.0, "expected_payout": 18.78},
-    "smb compass":     {"rank": 2.0, "expected_payout": 14.76},
-    "forward funding": {"rank": 3.0, "expected_payout": 14.71}
+    "xlt":                  {"rank": 1.0, "expected_payout": 106.53},
+    "businessloans.com":    {"rank": 2.0, "expected_payout": 70.73},
+    "fundera / nerdwallet": {"rank": 3.0, "expected_payout": 15.15}
   },
   "meta": {
-    "model_version": "d1b0064bfaed...", "payout_backend": "surrogate",
-    "payout_exact": false, "brands_ranked": 15, "latency_ms": 3.7
+    "model_version": "9ba388a575a7...", "payout_backend": "surrogate",
+    "payout_exact": false, "brands_ranked": 6, "latency_ms": 2.152
   }
 }
 ```
 
-Truncated to the top three of ten. The payouts are this model's, not the contract's:
+Truncated to the top three of six. The payouts are this model's, not the contract's:
 `meta.model_version` is in every response precisely because the numbers move with the
 version, and re-running the example after a retrain is expected to produce different ones.
 
@@ -571,7 +571,7 @@ blocks the event loop and every other in-flight request queues behind it — and
 handler's own timer cannot see that wait, so the endpoint looks healthy while users
 wait seconds.
 
-Parallelism is by process (`--workers 3` on 4 cores), with each worker pinned to one
+Parallelism is by process (`--workers 3` on 12 cores), with each worker pinned to one
 BLAS thread. `--no-access-log` matters more than it sounds: logging every request took
 p99 from 14 ms to 225 ms at 120 rps in the measurements this design is based on.
 

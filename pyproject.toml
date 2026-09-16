@@ -34,7 +34,7 @@ bl-schedule = "bl_ranking.ops.schedule:main"
 train = [
   "mlflow==2.19.0",
   "deltalake==0.24.0",
-  # 2.4 GB resident and 18 s to construct. Training needs it to build the gender
+  # 2.1 GB resident and 9.5 s to construct. Training needs it to build the gender
   # lookup table; serving does not, which is the point of building the table.
   "names-dataset==3.1.0",
   "tabpfn-client==0.5.3",
@@ -87,7 +87,7 @@ filterwarnings = [
 ]
 markers = [
   "slow: exercises a full training run or the research pipeline (minutes)",
-  "needs_names_dataset: requires names-dataset installed (2.4 GB resident)",
+  "needs_names_dataset: requires names-dataset installed (2.1 GB resident)",
 ]
 
 [tool.ruff]
