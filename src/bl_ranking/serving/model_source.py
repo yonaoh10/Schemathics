@@ -25,6 +25,7 @@ answerable without guessing.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -59,6 +60,38 @@ BUNDLE_SOURCE_LOCAL = "local_run_directory"
 # Set by resolve_bundle, read by the app when it builds /model.
 last_bundle_source: str = BUNDLE_SOURCE_REGISTRY
 
+# Startup must fail fast when the registry is unreachable. With MLflow's defaults
+# (MLFLOW_HTTP_REQUEST_MAX_RETRIES=5, backoff factor 2) an unreachable registry took ~62 s
+# to raise, and because resolve_bundle runs in the lifespan hook *before* uvicorn accepts
+# connections, /healthz, /readyz and /model were all unreachable for 68 s - long enough for
+# a liveness probe to kill the worker and for compose's `restart: unless-stopped` to loop
+# it. Bounded here so the worker comes up within a few seconds and answers 503 with the
+# reason while the registry is down, which is what the load balancer routes around.
+_STARTUP_HTTP_RETRIES = "2"
+_STARTUP_HTTP_TIMEOUT = "5"
+
+
+@contextlib.contextmanager
+def _bounded_registry_http():
+    """Cap MLflow's HTTP retries/timeout for the start-up resolution only.
+
+    An operator's own values win (setdefault), and anything this sets that was previously
+    unset is removed again afterwards, so this changes nothing for the training job, which
+    imports none of this and wants MLflow's normal retry budget for artifact uploads.
+    """
+    wanted = {
+        "MLFLOW_HTTP_REQUEST_MAX_RETRIES": _STARTUP_HTTP_RETRIES,
+        "MLFLOW_HTTP_REQUEST_TIMEOUT": _STARTUP_HTTP_TIMEOUT,
+    }
+    added = [k for k in wanted if not os.environ.get(k)]
+    for key in added:
+        os.environ[key] = wanted[key]
+    try:
+        yield
+    finally:
+        for key in added:
+            os.environ.pop(key, None)
+
 
 def resolve_bundle(settings: Settings) -> Path:
     """Return a local directory containing the model bundle."""
@@ -66,13 +99,16 @@ def resolve_bundle(settings: Settings) -> Path:
     explicit = settings.serving.model_uri
     if explicit:
         last_bundle_source = BUNDLE_SOURCE_PINNED
-        return _from_uri(explicit, settings)
+        with _bounded_registry_http():
+            return _from_uri(explicit, settings)
 
     default_uri = f"models:/{settings.mlflow.registered_model}@{settings.mlflow.serving_alias}"
     try:
-        resolved = _from_uri(default_uri, settings)
+        with _bounded_registry_http():
+            resolved = _from_uri(default_uri, settings)
     except Exception as exc:  # noqa: BLE001 - classified below
-        if _registry_is_authoritative(settings) and not _alias_is_unset(exc):
+        authoritative = _registry_is_authoritative(settings)
+        if authoritative and not _alias_is_unset(exc):
             # The local fallback picks the NEWEST bundle on disk, which after a rollback
             # is precisely the version the operator rolled back from. Falling back here
             # would silently undo their decision and report the worker healthy while
@@ -85,6 +121,21 @@ def resolve_bundle(settings: Settings) -> Path:
                 f"configured, so the registry decides which version serves; refusing to "
                 f"fall back to a local bundle, which after a rollback would be the "
                 f"version that was rolled back from."
+            ) from exc
+        # A missing MODEL (not a missing alias) against an administered registry that holds
+        # other models is a mistyped BL_MLFLOW__REGISTERED_MODEL, not an empty registry -
+        # and falling back there serves the newest local bundle (after a rollback, the one
+        # rolled back from) under a green /readyz. The genuinely empty registry is the
+        # documented `docker compose up` bootstrap and must still fall back so the first
+        # train-prod can be served. The registry just answered, so the one question that
+        # tells these apart - is it empty? - is affordable here.
+        if authoritative and _is_missing_model(exc) and not _registry_is_empty(settings):
+            raise RuntimeError(
+                f"could not resolve {default_uri} ({exc}). The registry holds other models "
+                f"but not {settings.mlflow.registered_model!r}, so this is a mistyped "
+                f"registered model, not an empty registry; refusing to fall back to a local "
+                f"bundle, which would serve whatever is newest on disk under a healthy "
+                f"/readyz. Check BL_MLFLOW__REGISTERED_MODEL."
             ) from exc
         log.warning("could not resolve %s (%s); falling back to the newest local run. "
                     "GET /model reports bundle_source=%s so this is visible from outside "
@@ -130,6 +181,38 @@ def _alias_is_unset(exc: BaseException) -> bool:
     return getattr(exc, "error_code", "") in {
         "RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE",
     }
+
+
+def _is_missing_model(exc: BaseException) -> bool:
+    """True when the registry said the registered MODEL does not exist.
+
+    RESOURCE_DOES_NOT_EXIST is the code for a missing model; a missing *alias* on a model
+    that exists is INVALID_PARAMETER_VALUE (see _alias_is_unset). Only the former can be a
+    typo in the model name, and only then is the is-the-registry-empty question worth asking.
+    """
+    from mlflow.exceptions import MlflowException
+
+    if not isinstance(exc, MlflowException):
+        return False
+    return getattr(exc, "error_code", "") == "RESOURCE_DOES_NOT_EXIST"
+
+
+def _registry_is_empty(settings: Settings) -> bool:
+    """True when the registry holds no registered models at all - a bootstrap, not a typo.
+
+    A mistyped model name leaves the correctly-named model in the registry, so the search
+    returns something and this is False; a fresh registry returns nothing. Asked only after
+    the registry has already answered RESOURCE_DOES_NOT_EXIST, so it is one cheap extra call
+    (6 ms on the file store) and not a probe against an unreachable server. If the search
+    itself fails, treat the registry as not-empty: refusing is the safe direction, because
+    the alternative is serving a local bundle that may undo a rollback.
+    """
+    try:
+        with _bounded_registry_http():
+            mlflow.set_tracking_uri(settings.mlflow.resolved_tracking_uri())
+            return not MlflowClient().search_registered_models(max_results=1)
+    except Exception:  # noqa: BLE001 - unreachable now means refuse, the safe direction
+        return False
 
 
 def _registry_is_authoritative(settings: Settings) -> bool:

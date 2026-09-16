@@ -116,6 +116,27 @@ def set_alias(settings: Settings, version: str, alias: str | None = None) -> dic
             "run_id": target.run_id}
 
 
+def rollback_advice(tracking_uri: str) -> str:
+    """What to do after moving the alias, given the registry it was moved in.
+
+    The alias only takes effect where the serving processes read it. A host command with
+    no MLFLOW_TRACKING_URI set resolves the local file store under mlruns/, while the Docker
+    deployment reads http://mlflow:5000 - so a file-store rollback is a no-op for the
+    deployment, and telling the operator to "restart api" then hides that. The advice is
+    keyed off whether the registry that changed is the administered one the deployment uses.
+    """
+    from bl_ranking.serving.model_source import _is_administered
+
+    if _is_administered(tracking_uri):
+        return ("Restart the serving processes to pick it up:\n"
+                "  docker compose -f docker/docker-compose.yml restart api")
+    return ("This is a LOCAL file-store registry, not the one the Docker deployment reads\n"
+            "(that is MLFLOW_TRACKING_URI=http://mlflow:5000). To roll back the deployment,\n"
+            "point this command at that registry and restart the API:\n"
+            "  make rollback VERSION=<n> MLFLOW_TRACKING_URI=http://localhost:5000\n"
+            "  docker compose -f docker/docker-compose.yml restart api")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -136,13 +157,20 @@ def main() -> None:
             print(f"no versions registered for {settings.mlflow.registered_model}")
             return
         print(f"{'':2} {'ver':>4}  {'backend':<18} {'exact':<6} {'data':>5} "
-              f"{'rows':>9}  {'git':<12} run")
+              f"{'fit rows':>9}  {'git':<12} run")
         for row in rows:
             marker = "->" if row["serving"] else "  "
             print(f"{marker} {row['version']:>4}  {row['payout_backend']:<18} "
                   f"{row['payout_exact']:<6} {row['delta_version']:>5} "
                   f"{row['rows_train']:>9}  {row['git_sha']:<12} {row['run_id'][:12]}")
         print(f"\n-> = serving now (alias '{settings.mlflow.serving_alias}')")
+        # "fit rows", not "rows": this is manifest.rows_train, the rows the models actually
+        # fitted on (after the survey-sufficiency drop and, in production, the split). It is
+        # not the snapshot size read from Delta - GET /model's data.rows is that - and the
+        # two differ by around a tenth on the real extract. Labelling the column as the
+        # smaller quantity is what stops a reader concluding the champion saw less data than
+        # a version whose column happened to record the snapshot instead.
+        print("fit rows = rows fitted (manifest.rows_train), not the Delta snapshot size")
 
     elif args.command == "current":
         info = current(settings)
@@ -150,10 +178,15 @@ def main() -> None:
               f"alias '{settings.mlflow.serving_alias}' is not set")
 
     else:
+        # Which registry this actually talks to, resolved the same way serving resolves it,
+        # reported so a rollback that landed in the local file store instead of the
+        # deployment's registry is visible rather than silent.
+        tracking = settings.mlflow.resolved_tracking_uri()
         result = set_alias(settings, args.version, args.alias)
+        result["tracking_uri"] = tracking
         print(json.dumps(result, indent=2))
-        print("\nRestart the serving processes to pick it up:")
-        print("  docker compose -f docker/docker-compose.yml restart api")
+        print(f"\nalias moved in the registry at {tracking}")
+        print(rollback_advice(tracking))
 
 
 if __name__ == "__main__":

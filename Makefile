@@ -17,6 +17,11 @@ SHELL := /bin/bash
 PYTHON ?= .venv/bin/python
 PIP ?= .venv/bin/pip
 export PYTHONPATH := $(CURDIR)/src
+# Exported so `make rollback VERSION=n MLFLOW_TRACKING_URI=http://localhost:5000` reaches
+# the recipe's environment: registry.py resolves the registry from this variable, and
+# without it a host rollback silently targets the local file store under mlruns/ instead
+# of the registry the Docker deployment reads. Unset here, it stays the local file store.
+export MLFLOW_TRACKING_URI
 COMPOSE := docker compose -f docker/docker-compose.yml
 
 # The offline-safe backend. Override for the real thing:
@@ -101,6 +106,9 @@ schedule:
 
 # Rollback is a registry operation, not a redeploy: move the alias, restart the API.
 #   make rollback VERSION=3
+# Targets the local file store by default. To roll back the Docker deployment, name its
+# registry so the alias moves where the API reads it:
+#   make rollback VERSION=3 MLFLOW_TRACKING_URI=http://localhost:5000
 rollback:
 	@test -n "$(VERSION)" || (echo "usage: make rollback VERSION=<n>" && exit 1)
 	$(PYTHON) -m bl_ranking.ops.registry rollback --version $(VERSION)

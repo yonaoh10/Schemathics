@@ -660,6 +660,83 @@ def test_an_unreachable_registry_does_not_undo_a_rollback(bundle, settings, monk
     monkeypatch.setattr(settings.mlflow, "tracking_uri", None, raising=False)
     assert model_source.resolve_bundle(settings).exists()
 
+
+def test_a_mistyped_registered_model_is_refused_not_served_locally(
+        bundle, settings, monkeypatch):
+    """A missing MODEL against a registry that holds other models is a typo, not a bootstrap.
+
+    Falling back there serves the newest local bundle - after a rollback, the version rolled
+    back from - under a green /readyz, which is exactly what makes a mistyped
+    BL_MLFLOW__REGISTERED_MODEL invisible. A genuinely empty registry is the documented
+    `docker compose up` bootstrap and must still fall back so the first train-prod is served.
+    The two wear the same RESOURCE_DOES_NOT_EXIST code and are told apart by whether the
+    registry is empty.
+    """
+    import pytest
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
+
+    from bl_ranking.serving import model_source
+
+    def missing_model(uri, s):
+        raise MlflowException("Registered Model with name=bl_brand_rankr not found",
+                              error_code=RESOURCE_DOES_NOT_EXIST)
+
+    monkeypatch.setattr(model_source, "_from_uri", missing_model)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+
+    # The registry holds other models -> the name is a typo -> refuse rather than guess.
+    monkeypatch.setattr(model_source, "_registry_is_empty", lambda s: False)
+    with pytest.raises(RuntimeError, match="mistyped"):
+        model_source.resolve_bundle(settings)
+
+    # An empty registry -> genuine bootstrap -> fall back to the local bundle the fixture built.
+    monkeypatch.setattr(model_source, "_registry_is_empty", lambda s: True)
+    assert model_source.resolve_bundle(settings).exists()
+
+
+def test_startup_registry_resolution_bounds_the_retry_budget(settings, monkeypatch):
+    """An unreachable registry took ~62 s to raise under MLflow's default retry schedule,
+    and resolve_bundle runs in the lifespan hook before uvicorn accepts connections, so
+    /healthz and /readyz were dead for 68 s - long enough for a liveness probe to kill the
+    worker. The resolution now runs under a low retry cap so the worker comes up and answers
+    503 within seconds. An operator's own value still wins, and a cap this set is removed
+    again so nothing leaks into the training job's normal retry budget.
+    """
+    import os
+
+    import pytest
+
+    from bl_ranking.serving import model_source
+
+    seen = {}
+
+    def capture(uri, s):
+        seen["retries"] = os.environ.get("MLFLOW_HTTP_REQUEST_MAX_RETRIES")
+        seen["timeout"] = os.environ.get("MLFLOW_HTTP_REQUEST_TIMEOUT")
+        raise RuntimeError("stop after reading the environment")
+
+    monkeypatch.setattr(model_source, "_from_uri", capture)
+    monkeypatch.setattr(settings.serving, "model_uri", "models:/x@y", raising=False)
+    monkeypatch.delenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("MLFLOW_HTTP_REQUEST_TIMEOUT", raising=False)
+
+    with pytest.raises(RuntimeError):
+        model_source.resolve_bundle(settings)
+    assert seen["retries"] == model_source._STARTUP_HTTP_RETRIES
+    assert int(seen["retries"]) <= 3, "the cap must be well below MLflow's default of 5"
+    assert seen["timeout"] == model_source._STARTUP_HTTP_TIMEOUT
+    # Set here only for the resolution, so it is removed again afterwards.
+    assert os.environ.get("MLFLOW_HTTP_REQUEST_MAX_RETRIES") is None
+
+    # An operator who set their own value keeps it, during and after.
+    monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "9")
+    with pytest.raises(RuntimeError):
+        model_source.resolve_bundle(settings)
+    assert seen["retries"] == "9"
+    assert os.environ.get("MLFLOW_HTTP_REQUEST_MAX_RETRIES") == "9"
+
+
 def test_one_malformed_cell_does_not_fail_the_whole_pyfunc_batch(bundle, settings):
     """Per-row isolation has to survive the normalisation step too.
 
@@ -1867,6 +1944,50 @@ def test_no_shipped_launcher_pins_the_serving_backend():
     assert "origin BACKEND" in serve_target, (
         "make serve must pass BACKEND through only when it was asked for on the command "
         f"line, got: {serve_target!r}")
+
+
+def test_the_mlflow_env_vars_reach_a_container():
+    """.env.example documents BL_MLFLOW__REGISTERED_MODEL and BL_MLFLOW__SERVING_ALIAS, but
+    with no env_file and no interpolation nothing read them: an operator canarying with
+    SERVING_ALIAS=challenger got a container still resolving @champion, healthy-looking. Both
+    are interpolated into the api service now, so a value in .env actually takes effect."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    env_example = (root / ".env.example").read_text()
+    compose = yaml.safe_load((root / "docker" / "docker-compose.yml").read_text())
+    api_env = compose["services"]["api"]["environment"]
+
+    for var in ("BL_MLFLOW__REGISTERED_MODEL", "BL_MLFLOW__SERVING_ALIAS"):
+        assert var in env_example, f"{var} should be documented in .env.example"
+        assert var in api_env, f"{var} is documented in .env.example but not on the api service"
+        assert f"${{{var}" in api_env[var], (
+            f"{var} is hard-set on the api service, so .env cannot change it")
+
+
+@pytest.mark.parametrize("tracking_uri, mentions_docker_only, mentions_local", [
+    ("http://mlflow:5000", True, False),
+    ("http://localhost:5000", True, False),
+    ("sqlite:////mlflow/mlflow.db", True, False),
+    ("databricks", True, False),
+    ("file:///repo/mlruns", False, True),
+    ("/repo/mlruns", False, True),
+])
+def test_rollback_advice_matches_the_registry_it_changed(
+        tracking_uri, mentions_docker_only, mentions_local):
+    """A host rollback with no MLFLOW_TRACKING_URI set moves the alias in the local file
+    store, while the deployment reads http://mlflow:5000 - so it was a no-op that still
+    printed "restart api". The advice now depends on which registry actually changed: a
+    local file store gets told it is local and how to reach the deployment's registry."""
+    from bl_ranking.ops.registry import rollback_advice
+
+    advice = rollback_advice(tracking_uri)
+    if mentions_local:
+        assert "LOCAL file-store registry" in advice
+        assert "MLFLOW_TRACKING_URI=http://localhost:5000" in advice
+    else:
+        assert "LOCAL file-store registry" not in advice
+        assert "restart api" in advice
 
 
 @pytest.mark.parametrize("value", [8, 80, 8000, 2])

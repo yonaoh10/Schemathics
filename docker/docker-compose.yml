@@ -59,6 +59,11 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       TABPFN_TOKEN: ${TABPFN_TOKEN:-}
       BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-catboost_fallback}
+      # Register (and move the serving alias) under the same names the API resolves, so
+      # setting these in .env keeps training and serving pointed at one model. Defaults
+      # match conf/config.yaml.
+      BL_MLFLOW__REGISTERED_MODEL: ${BL_MLFLOW__REGISTERED_MODEL:-bl_brand_ranker}
+      BL_MLFLOW__SERVING_ALIAS: ${BL_MLFLOW__SERVING_ALIAS:-champion}
     volumes:
       - ..:/app
     # Overridden on the command line, e.g. `run --rm train --mode production`.
@@ -75,6 +80,11 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       TABPFN_TOKEN: ${TABPFN_TOKEN:-}
       BL_MODEL__PAYOUT__BACKEND: ${BL_PAYOUT_BACKEND:-catboost_fallback}
+      # Register (and move the serving alias) under the same names the API resolves, so
+      # setting these in .env keeps training and serving pointed at one model. Defaults
+      # match conf/config.yaml.
+      BL_MLFLOW__REGISTERED_MODEL: ${BL_MLFLOW__REGISTERED_MODEL:-bl_brand_ranker}
+      BL_MLFLOW__SERVING_ALIAS: ${BL_MLFLOW__SERVING_ALIAS:-champion}
     volumes:
       - ..:/app
     command: ["python", "-m", "bl_ranking.ops.schedule"]
@@ -103,6 +113,13 @@ services:
       # Sharing BL_PAYOUT_BACKEND with the training services would undo that the moment
       # anyone set it - and .env.example sets it, because training does want a default.
       BL_MODEL__PAYOUT__BACKEND: ${BL_SERVING_PAYOUT_BACKEND:-}
+      # Which registered model and alias this worker resolves. Interpolated from the
+      # environment so .env can actually change them - they were documented in .env.example
+      # but referenced by no service, so an operator canarying with SERVING_ALIAS=challenger
+      # got a container still resolving @champion while GET /model looked healthy. Defaults
+      # match conf/config.yaml.
+      BL_MLFLOW__REGISTERED_MODEL: ${BL_MLFLOW__REGISTERED_MODEL:-bl_brand_ranker}
+      BL_MLFLOW__SERVING_ALIAS: ${BL_MLFLOW__SERVING_ALIAS:-champion}
       BL_SERVING__WORKERS: ${BL_SERVING_WORKERS:-3}
       BL_SERVING__THREADS_PER_WORKER: "1"
       # Where the workers share their Prometheus counters, so one scrape covers all three
@@ -112,8 +129,8 @@ services:
       PROMETHEUS_MULTIPROC_DIR: /tmp/bl-metrics
     volumes:
       - ..:/app
-    # Each worker holds its own copy of the model and the gender table: 866 MB resident
-    # measured warm, 688 MB of it private, so three workers come to 2.1 GB. Sized for that
-    # with headroom; raise alongside BL_SERVING__WORKERS.
+    # Each worker holds its own copy of the model and the gender table: ~634 MB resident
+    # measured warm, so three workers come to about 1.9 GB. Sized for that with headroom;
+    # raise alongside BL_SERVING__WORKERS.
     mem_limit: 4g
     restart: unless-stopped
