@@ -1,9 +1,12 @@
 """Synthetic bl_full_data.csv generator.
 
-The real extract lives in a private Drive folder, so the repository ships a generator
-instead. It is not a placeholder: the goal is a file that drives every branch of
-bl_models_train.py the way the real one does, so that training, evaluation, artifact
-production and serving can all be exercised end to end.
+The real extract is not kept in git, so the repository also ships a generator as a
+fallback for when it is not present locally. It is not a placeholder: the goal is a file
+that drives every branch of bl_models_train.py the way the real one does, so that
+training, evaluation, artifact production and serving can all be exercised end to end.
+When the real `bl_full_data.csv` is dropped at data/raw/, the generator step is a no-op
+and everything downstream runs on it unchanged - which is how the published numbers were
+measured.
 
 Three properties matter and are tested in tests/test_generated_data.py:
 

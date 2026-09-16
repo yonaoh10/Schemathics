@@ -168,11 +168,11 @@ real leads carrying name-derived and geographic features.
 
 ---
 
-## 4. Dilemma 3 — the data is not available
+## 4. Dilemma 3 — building before the data arrived
 
-The extract lives in a private Drive folder I could not reach. Two options: stub
-something in and hope, or build a substitute good enough that the pipeline is genuinely
-exercised.
+The extract lived in a private Drive folder I could not reach while building. Two
+options: stub something in and hope, or build a substitute good enough that the pipeline
+is genuinely exercised.
 
 I built the substitute, and made its fidelity testable. Brand acceptance is a logistic
 function of a standardised user profile with per-brand weights, and payout is a
@@ -185,6 +185,10 @@ extract always contains are present.
 
 Dropping the real CSV at `data/raw/bl_full_data.csv` makes the generator step a no-op.
 Nothing downstream changes.
+
+The extract was later provided, and every number in this document and in the README was
+re-measured on it (128,442 rows, Delta version 0) — which is also the test the paragraph
+above predicted: dropping the real CSV in changed nothing downstream.
 
 Building the generator also turned out to be how I found the train/serve skew in §5:
 writing a faithful generator forced me to work out exactly which columns can be null,
