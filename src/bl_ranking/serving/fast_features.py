@@ -415,8 +415,10 @@ def rank_from_scores(brands: np.ndarray, prob_lead: np.ndarray,
 
     kept_brands = brands[keep]
     kept_expected = expected[keep]
-    # 'first' ranking over a descending sort == the order produced by a stable argsort
-    # of the negated scores.
+    # 'first' ranking over a *stable* descending sort == a stable argsort of the negated
+    # scores. The research path calls sort_values first (quicksort, not stable), so on an
+    # exact tie the two can order the tied block differently; wherever the scores are
+    # distinct they agree, which is the case the equivalence test exercises.
     order = np.argsort(-kept_expected, kind="stable")
     return {
         str(kept_brands[idx]): {

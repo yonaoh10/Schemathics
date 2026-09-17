@@ -53,7 +53,7 @@ and requires identical brand order, identical ranks and identical expected payou
 caught two divergences I had not anticipated, both of which turned out to be real
 findings about the original code (§5).
 
-**Result: 66.8 ms to 2.7 ms**, a factor of 26, with the original one environment
+**Result: 66.8 ms to 2.7 ms**, a factor of 25, with the original one environment
 variable away.
 
 Two things I deliberately did not do. I did not "improve" the band mappings whose

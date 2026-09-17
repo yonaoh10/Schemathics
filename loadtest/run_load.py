@@ -17,8 +17,8 @@ moment they were *due* - which is what the user on the landing page actually exp
 Which client is slow
 --------------------
 Open loop has a failure mode of its own, and this harness walked straight into it. One
-asyncio process on a four-core box, three uvicorn workers on the same four cores: past a
-couple of hundred requests per second the *generator* is what runs out of CPU. Its own
+asyncio process on a twelve-core box, three uvicorn workers on the same twelve cores: past
+a couple of hundred requests per second the *generator* is what runs out of CPU. Its own
 scheduling loop falls behind, requests go out long after they were due, and because client
 latency is measured from the due time, every second of the generator's lateness is charged
 to the server. The numbers that produced were not merely noisy, they were inverted: the
@@ -205,7 +205,7 @@ class Result:
             "connections": self.connections,
             "span_s": round(span, 2),
             # What else the box was doing. A latency report from a machine under unrelated
-            # load is not wrong, it is unattributable - and this harness shares four cores
+            # load is not wrong, it is unattributable - and this harness shares twelve cores
             # with the server it measures.
             "loadavg_1m": self.loadavg_1m,
             "max_send_lag_ms": self.max_send_lag_ms,
@@ -294,7 +294,7 @@ def run_sweep_point(url: str, payloads: list[bytes], target_rps: float, duration
     """One target rate, offered by `processes` generators at once.
 
     One event loop cannot schedule much past a couple of hundred arrivals per second while
-    sharing four cores with the server, and when it falls behind it charges its own lateness
+    sharing twelve cores with the server, and when it falls behind it charges its own lateness
     to the server (see the module docstring). Splitting the rate is what makes a capacity
     number about the service.
 

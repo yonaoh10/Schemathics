@@ -480,7 +480,7 @@ classifier), models already warm, one request being one user scored against 10 b
 | the research pipeline as written | 66.8 ms | 71.8 ms | 79.5 ms |
 | what this system serves | **2.7 ms** | 3.38 ms | 3.82 ms |
 
-26x, and every step of it exact-preserving. Where the 2.7 ms goes — reproduce any of this
+25x, and every step of it exact-preserving. Where the 2.7 ms goes — reproduce any of this
 with `python scripts/profile_request.py`:
 
 | stage | p50 |

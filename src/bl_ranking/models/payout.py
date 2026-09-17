@@ -430,8 +430,7 @@ class TabPFNClientBackend(PayoutBackend):
         which quantises every call onto a 200 ms grid - a 150-195 ms tax on a request
         that should take far less.
 
-    A stored id could in principle expire server-side. The weekly retrain refreshes it,
-    and a failed predict falls back to fitting once, in-process.
+    A stored id could in principle expire server-side; the weekly retrain refreshes it.
     """
 
     name = "tabpfn_client"

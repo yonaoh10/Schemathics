@@ -32,11 +32,20 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.19.0
+    # --artifacts-destination, NOT --default-artifact-root. With --serve-artifacts the
+    # default artifact root is `mlflow-artifacts:/` - the proxy - and clients upload and
+    # download through this server. Naming a container path as the default artifact root
+    # overrides that proxy, so every client resolves /mlflow/artifacts on its OWN
+    # filesystem; train and scheduler mount only `..:/app`, so the researcher log, the
+    # bundle and the model were written into a dead container layer and the documented
+    # `run --rm train` then `up api` path 503'd blaming the registry. This flag instead
+    # says where *this* server keeps proxied artifacts - inside the ../mlruns bind mount,
+    # so they survive restarts and stay readable from the host.
     command: >
       mlflow server
       --host 0.0.0.0 --port 5000
       --backend-store-uri sqlite:////mlflow/mlflow.db
-      --default-artifact-root /mlflow/artifacts
+      --artifacts-destination /mlflow/artifacts
       --serve-artifacts
     ports: ["5000:5000"]
     volumes:

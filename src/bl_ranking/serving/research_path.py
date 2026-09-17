@@ -3,7 +3,7 @@
 Kept in its own module because importing it is expensive: bl_exp_payout_predictor.py
 runs `nd = NameDataset()` at module scope, which costs 9.5 s and 2.1 GB of resident
 memory. Production serves the fast path (serving/fast_features.py) and never imports
-this, so a serving container starts in ~3.9 s and holds ~290 MB.
+this, so a serving container starts in ~3.6 s and holds ~357 MB.
 
 It is imported on demand when `serving.feature_path = research`, and by the equivalence
 test, which is exactly what it is for: the reference implementation the fast path is

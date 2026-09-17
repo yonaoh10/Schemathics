@@ -367,7 +367,7 @@ def _assemble_bundle(run_dir: Path, trainer: ProductionTrainer, snapshot,
             )
         shutil.copy2(source, bundle_dir / name)
 
-    # Removes names-dataset (18s, 2.4GB) from the serving image entirely.
+    # Removes names-dataset (9.5 s, 2.1 GB) from the serving image entirely.
     if settings.model.build_gender_lookup:
         GenderLookup.build(bundle_dir / GENDER_ARTIFACT)
 
@@ -387,9 +387,10 @@ def _assemble_bundle(run_dir: Path, trainer: ProductionTrainer, snapshot,
         delta_version=snapshot.version,
         delta_table=snapshot.table_uri,
         # What was fitted, not what was read. The research code splits the last
-        # days_for_test days off in both modes (bl_models_train.py line 235), so the
-        # snapshot size overstated this by about a tenth on the real extract - in the
-        # shipped manifest, in the registered version's tags, and in `make versions`.
+        # days_for_test days off in both modes (bl_models_train.py line 235), and drops
+        # rows before that, so the snapshot size overstated this by 57% on the real
+        # extract - 128,442 against 55,368 - in the shipped manifest, in the registered
+        # version's tags, and in `make versions`.
         rows_train=int(trainer.split_counts.get("rows_fitted", len(snapshot.frame))),
         rows_payout_context=len(payout_context["x"]),
         n_brands=int((clients["client_name"] != "other").sum()),
@@ -473,10 +474,11 @@ def _serving_requirements() -> list[str]:
 def _new_run_dir(settings: Settings, mode: str) -> Path:
     """A fresh directory per run, stamped in UTC and never reused.
 
-    UTC because the name is also an ordering: serving's offline fallback picks the newest
-    `runs/*/bundle` by sorting these names (serving/model_source._latest_local_bundle).
-    Local time breaks both halves of that. A DST fall-back repeats an hour, so two
-    retrains an hour apart could land on the same second-resolution name - and
+    UTC because the name is also an ordering: serving's offline fallback keys on each
+    bundle's own `trained_at` and uses these names to break a tie, or alone when a
+    manifest will not read (serving/model_source._latest_local_bundle). Local time breaks
+    both halves of that. A DST fall-back repeats an hour, so two retrains an hour apart
+    could land on the same second-resolution name - and
     `exist_ok=True` meant the second one wrote its artifacts over the first, into a
     directory whose manifest belonged to the other run. Moving the container's TZ
     backwards has the same effect on the ordering: the newest bundle stops being the last

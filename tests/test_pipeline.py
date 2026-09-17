@@ -1612,8 +1612,8 @@ def test_a_windows_drive_letter_is_a_directory_not_a_registry(settings, monkeypa
 def test_the_run_reports_the_rows_it_actually_fitted(tmp_path):
     """The research code calls split_by_time in BOTH modes, so the fit never sees the last
     7 days of the window - production included. The manifest reported len(snapshot) as
-    rows_train, which overstated it by about a tenth on the real extract, and the docs
-    called production mode "fit on everything". The split is observed, not changed."""
+    rows_train, which overstated it by 57% on the real extract, and the docs called
+    production mode "fit on everything". The split is observed, not changed."""
     import numpy as np
 
     from bl_ranking.training.trainer import ProductionTrainer

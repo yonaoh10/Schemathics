@@ -17,10 +17,10 @@ Quartz is 6 or 7 fields and starts at seconds, unlike the 5-field unix cron. Get
 that wrong is the classic way to schedule a job for the wrong time, so the local runner
 parses the same string instead of keeping a second copy in a different dialect.
 
-Locally, `python -m bl_ranking.ops.schedule` runs an APScheduler process that fires
-`training.job.run(train_test=False)` on that schedule. On Databricks the same expression
-goes into the job definition in databricks.yml at the repository root, and no scheduler
-process exists at all.
+Locally, `python -m bl_ranking.ops.schedule` runs an APScheduler process that fires the
+same three steps as the Databricks job - ingest, train, then evaluate (see `_train`) - on
+that schedule. On Databricks the same expression goes into the job definition in
+databricks.yml at the repository root, and no scheduler process exists at all.
 
 "Both are driven by `schedule.cron`" was too strong: a bundle cannot read our config file,
 so the expression is copied into it by hand. What keeps them together is a test that reads

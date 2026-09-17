@@ -3,7 +3,7 @@
 # They are deliberately different. Training needs names-dataset (2.1 GB resident, 9.5 s
 # to construct) to build the gender lookup table; serving reads that table out of the
 # model bundle and never imports the library. Splitting the images is what turns a
-# ~10-second, multi-gigabyte cold start into a sub-second one.
+# ~10-second, multi-gigabyte cold start into a 3.6-second, 357 MB one.
 #
 #   docker build -f docker/Dockerfile --target training -t bl-ranking-train .
 #   docker build -f docker/Dockerfile --target serving  -t bl-ranking-api   .

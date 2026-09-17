@@ -6,7 +6,7 @@ function, and the only honest way to make that claim is to check it - on the wor
 example, on randomised well-formed users, and on the malformed ones a real funnel sends.
 
 The research path imports bl_exp_payout_predictor, which builds a NameDataset at module
-scope (18 s, 2.4 GB). The tests are marked accordingly and skip cleanly where the
+scope (9.5 s, 2.1 GB). The tests are marked accordingly and skip cleanly where the
 library is absent.
 """
 

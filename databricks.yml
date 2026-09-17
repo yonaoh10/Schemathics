@@ -133,7 +133,9 @@ resources:
       job_clusters:
         - job_cluster_key: training
           new_cluster:
-            spark_version: "15.4.x-cpu-ml-scala2.12"
+            # 16.4 LTS ML, not 15.4 LTS ML: 15.4 ships Python 3.11 and pyproject.toml
+            # floors at >=3.12, so the wheel would refuse to install on the cluster.
+            spark_version: "16.4.x-cpu-ml-scala2.12"
             node_type_id: "Standard_D8ds_v5"
             num_workers: 0
             data_security_mode: SINGLE_USER

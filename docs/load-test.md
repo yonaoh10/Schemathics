@@ -192,12 +192,12 @@ gives 2.0 ms, the friendliest possible case for cache locality and the figure to
 comparing against a micro-benchmark rather than against traffic.
 
 The same request through the unmodified research pipeline — with the models already warm,
-so this excludes the per-request model loading it would also do — is **66.8 ms p50**, 26×
+so this excludes the per-request model loading it would also do — is **66.8 ms p50**, 25×
 the served path. The difference is pandas per-operation overhead, not arithmetic;
 `serving/fast_features.py` explains it line by line. (An earlier version of this document
-quoted 4.1 ms for the served path: that was measured before the gender lookup stopped
-materialising its table through `to_pylist()` on every load, and is not what the code does
-now — the 200-user figure with the fix in place is 2.7 ms.)
+quoted 4.1 ms for the served path: that was measured on a synthetic extract and a 4-vCPU
+container, before every figure here was re-run on the real extract and this machine. The
+200-user figure as measured now is 2.7 ms.)
 
 ## Payout backends
 

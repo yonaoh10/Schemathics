@@ -3,7 +3,7 @@
 # stubbed, so a contributor gets the same result CI does.
 #
 # The slow suite (feature equivalence against the research pipeline, and the gender
-# table against the live dataset) needs names-dataset, which is 2.4 GB resident. It runs
+# table against the live dataset) needs names-dataset, which is 2.1 GB resident. It runs
 # nightly rather than per push.
 name: ci
 

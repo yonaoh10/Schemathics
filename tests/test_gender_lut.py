@@ -1,6 +1,6 @@
 """The precomputed gender table must be the research function, not an approximation.
 
-models/gender_lut.py replaces an 18-second, 2.4 GB import with a 4 MB table. That is
+models/gender_lut.py replaces a 9.5-second, 2.1 GB import with a 4.2 MB table. That is
 only defensible if the table returns exactly what the research implementation returns,
 for every name - including the ones it does not know.
 
@@ -33,7 +33,7 @@ def built_table(tmp_path_factory):
 def _research_implementation(dataset, fname):
     """BLPayoutModelsFit.detect_gender_with_confidence, copied verbatim.
 
-    Copied rather than imported: importing the research module costs 18 s and 2.4 GB,
+    Copied rather than imported: importing the research module costs 9.5 s and 2.1 GB,
     and this is the definition under test.
     """
     result = dataset.search(fname)

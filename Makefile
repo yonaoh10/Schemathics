@@ -4,7 +4,7 @@
 #   make data       generate bl_full_data.csv (skipped if a real extract is present)
 #   make ingest     CSV -> Delta table, with the data-quality gate
 #   make train      evaluation mode: time split, per-day metrics, nothing registered
-#   make train-prod production mode: fit on all data, register a version, move champion
+#   make train-prod production mode: same 7-day split, register a version, move champion
 #   make serve      run the API locally
 #   make loadtest   open-loop latency sweep against a running API
 #   make test       the fast suite
@@ -82,8 +82,8 @@ serve:
 # Sweep rather than a single rate: the point at which achieved rps falls behind the
 # target is the capacity number, and a single point cannot show it.
 # GENERATORS, not workers: one asyncio process cannot schedule much past ~200 arrivals per
-# second while sharing four cores with the server, and when it falls behind it charges its
-# own lateness to the server - which is how this harness once reported 54 s p50 for an
+# second while sharing twelve cores with the server, and when it falls behind it charges
+# its own lateness to the server - which is how this harness once reported 54 s p50 for an
 # endpoint answering in 8 ms. Three generators offer the whole sweep with a send lag in the
 # low milliseconds. Override with `make loadtest GENERATORS=1` to see the difference.
 GENERATORS ?= 3
@@ -93,7 +93,7 @@ GENERATORS ?= 3
 # however long the run was left going. Long enough matters at the top of the sweep in the
 # other direction too - a 20 s run read 400 rps as comfortable and three 30 s runs could not
 # offer that rate at all. Even at 30 s, run the sweep more than once: 300 rps came back at
-# p99 48, 54 and 750 ms on three identical runs, so a single sweep can only mislead. See
+# p99 61, 81 and 122 ms on three identical runs, so a single sweep can only mislead. See
 # docs/load-test.md, which publishes medians of three with the spread.
 loadtest:
 	$(PYTHON) loadtest/run_load.py --url http://127.0.0.1:$(PORT)/rank \
